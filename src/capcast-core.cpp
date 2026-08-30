@@ -31,6 +31,8 @@
 #include <QApplication>
 #include <QWidget>
 
+#include <atomic>
+
 #ifdef _WIN32
 #include <windows.h>
 #include <winuser.h>
@@ -54,6 +56,10 @@ struct OutputState {
 };
 
 OutputState g_state;
+
+/* 送到采集卡的音量(百分比, 100 = 原始主混音音量)。
+ * 音频线程(on_master_audio)读取, UI 线程(设置面板)写入, 故用 atomic。 */
+std::atomic<double> g_volume_pct{50.0};
 
 /* 与 OBS 自身一致的日志宏 */
 #define CAPCAST_LOG(level, fmt, ...) \
@@ -280,21 +286,29 @@ static bool wasapi_start(const char *device_id)
 	return true;
 }
 
-/* 交错 float32 -> 设备原始格式 */
+/* 交错 float32 -> 设备原始格式, 同时应用输出音量增益 */
 static void convert_float_to_device(const float *src, uint8_t *dst,
-				    uint32_t frames)
+				    uint32_t frames, float gain)
 {
 	const UINT32 total = frames * g_wasapi.channels;
 
 	if (g_wasapi.dev_float) {
-		memcpy(dst, src, (size_t)total * sizeof(float));
+		float *p = reinterpret_cast<float *>(dst);
+		if (gain == 1.f) { /* 快速路径: 增益为 1 时直接拷贝 */
+			memcpy(dst, src, (size_t)total * sizeof(float));
+			return;
+		}
+		for (UINT32 i = 0; i < total; ++i) {
+			const float v = src[i] * gain;
+			p[i] = v < -1.f ? -1.f : (v > 1.f ? 1.f : v);
+		}
 		return;
 	}
 
 	switch (g_wasapi.dev_bits) {
 	case 8: { /* unsigned 8bit */
 		for (UINT32 i = 0; i < total; ++i) {
-			float v = src[i];
+			float v = src[i] * gain;
 			v = v < -1.f ? -1.f : (v > 1.f ? 1.f : v);
 			dst[i] = (uint8_t)(int)((v + 1.f) * 127.5f);
 		}
@@ -303,7 +317,7 @@ static void convert_float_to_device(const float *src, uint8_t *dst,
 	case 16: {
 		int16_t *p = reinterpret_cast<int16_t *>(dst);
 		for (UINT32 i = 0; i < total; ++i) {
-			float v = src[i];
+			float v = src[i] * gain;
 			v = v < -1.f ? -1.f : (v > 1.f ? 1.f : v);
 			p[i] = (int16_t)(v * 32767.f);
 		}
@@ -311,7 +325,7 @@ static void convert_float_to_device(const float *src, uint8_t *dst,
 	}
 	case 24: {
 		for (UINT32 i = 0; i < total; ++i) {
-			float v = src[i];
+			float v = src[i] * gain;
 			v = v < -1.f ? -1.f : (v > 1.f ? 1.f : v);
 			const int32_t s = (int32_t)(v * 8388607.f);
 			uint8_t *p = dst + (size_t)i * 3;
@@ -324,7 +338,7 @@ static void convert_float_to_device(const float *src, uint8_t *dst,
 	default: { /* 32bit int */
 		int32_t *p = reinterpret_cast<int32_t *>(dst);
 		for (UINT32 i = 0; i < total; ++i) {
-			float v = src[i];
+			float v = src[i] * gain;
 			v = v < -1.f ? -1.f : (v > 1.f ? 1.f : v);
 			p[i] = (int32_t)(v * 2147483647.f);
 		}
@@ -340,12 +354,14 @@ static void wasapi_write_audio(const float *src, uint32_t frames)
 	if (!g_wasapi.active || !g_wasapi.render || !src || frames == 0)
 		return;
 
-	/* 1) float -> 设备原始格式 */
+	/* 1) float -> 设备原始格式(同时应用用户设定的输出音量) */
+	const float gain =
+		(float)(g_volume_pct.load(std::memory_order_relaxed) / 100.0);
 	const size_t need =
 		(size_t)frames * g_wasapi.channels * (g_wasapi.dev_bits / 8);
 	if (g_wasapi.scratch.size() < need)
 		g_wasapi.scratch.resize(need);
-	convert_float_to_device(src, g_wasapi.scratch.data(), frames);
+	convert_float_to_device(src, g_wasapi.scratch.data(), frames, gain);
 	const uint8_t *data = g_wasapi.scratch.data();
 
 	/* 2) 目标积压 = 一个 OBS 音频块。让实际延迟贴着"一块"的量级,
@@ -466,6 +482,10 @@ static QString start_audio_routing(const QString &device_id)
 		return QStringLiteral("OBS 音频未初始化");
 	}
 
+	/* 载入输出音量(默认 50%) */
+	g_volume_pct.store(capcast::cfg_audio_volume(),
+			   std::memory_order_relaxed);
+
 	/* 让 OBS 直接用采集卡端点的采样率/声道把主混音转换成交错 float32,
 	 * 插件只做最后一次"float -> 设备原始格式"的落格式。
 	 * 这样混音、重采样、声道映射全部由 OBS 音频引擎负责。 */
@@ -477,10 +497,11 @@ static QString start_audio_routing(const QString &device_id)
 	obs_add_raw_audio_callback(0, &conv, on_master_audio, nullptr);
 
 	CAPCAST_LOG(LOG_INFO,
-		    "audio routing started: master mix -> %s (%uHz %uch %ubit%s)",
+		    "audio routing started: master mix -> %s (%uHz %uch %ubit%s), volume %.0f%%",
 		    qUtf8Printable(dev_id), g_wasapi.sample_rate,
 		    g_wasapi.channels, g_wasapi.dev_bits,
-		    g_wasapi.dev_float ? " float" : " int");
+		    g_wasapi.dev_float ? " float" : " int",
+		    g_volume_pct.load(std::memory_order_relaxed));
 	return {};
 #else
 	Q_UNUSED(device_id);
@@ -806,6 +827,27 @@ void cfg_set_audio_device(const QString &name, const QString &id)
 	config_set_string(user_config(), CFG_SECTION, "AudioDeviceId",
 			  qUtf8Printable(id));
 	cfg_flush();
+}
+
+double cfg_audio_volume()
+{
+	/* 未设置过 -> 默认 50%(用 has_user_value 判断, 避免把用户主动设的 0
+	 * 当成"未设置"而重置回 50) */
+	if (!config_has_user_value(user_config(), CFG_SECTION, "AudioVolume"))
+		return 50.0;
+	return config_get_double(user_config(), CFG_SECTION, "AudioVolume");
+}
+void cfg_set_audio_volume(double percent)
+{
+	config_set_double(user_config(), CFG_SECTION, "AudioVolume", percent);
+	cfg_flush();
+}
+
+void set_output_volume(double percent)
+{
+	/* 仅运行时生效: 音频线程下一次回调就会用新的增益, 无需重启路由。
+	 * 不在此处落盘 —— 拖动滑块会高频触发, 持久化交给设置面板保存时做。 */
+	g_volume_pct.store(percent, std::memory_order_relaxed);
 }
 
 QString cfg_source()

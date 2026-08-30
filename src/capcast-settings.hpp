@@ -9,6 +9,7 @@ class QComboBox;
 class QCheckBox;
 class QPushButton;
 class QLabel;
+class QSlider;
 class QCloseEvent;
 
 class CapCastSettings : public QDialog {
@@ -26,6 +27,7 @@ public:
 private slots:
 	void onStartClicked();
 	void onStopClicked();
+	void onVolumeChanged(int value);
 
 private:
 	void buildUi();
@@ -37,6 +39,8 @@ private:
 	QComboBox *displayCombo = nullptr;
 	QComboBox *audioCombo = nullptr;
 	QComboBox *sourceCombo = nullptr;
+	QSlider *volumeSlider = nullptr;
+	QLabel *volumeLabel = nullptr;
 	QCheckBox *autoStartCheck = nullptr;
 	QPushButton *startBtn = nullptr;
 	QPushButton *stopBtn = nullptr;

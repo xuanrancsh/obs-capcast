@@ -86,6 +86,15 @@ QString cfg_audio_device_id();              /* 手动指定音频设备 ID */
 QString cfg_audio_device_name();
 void cfg_set_audio_device(const QString &name, const QString &id);
 
+/* 输出到采集卡的音量(百分比): 100 = 原始主混音音量, 50 = 一半, 默认 50 */
+double cfg_audio_volume();
+void cfg_set_audio_volume(double percent);
+
+/* 运行时调整输出音量: 立即生效(无需重启路由), 不落盘
+ * (拖动滑块会高频调用, 持久化请用 cfg_set_audio_volume)。
+ * 只影响送到采集卡的声音, 不改 OBS 混音器里的任何音量。 */
+void set_output_volume(double percent);
+
 QString cfg_source();                       /* "program" | "preview" */
 void cfg_set_source(const QString &s);
 

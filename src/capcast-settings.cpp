@@ -11,6 +11,7 @@
 #include <QCheckBox>
 #include <QPushButton>
 #include <QLabel>
+#include <QSlider>
 #include <QFormLayout>
 #include <QVBoxLayout>
 #include <QHBoxLayout>
@@ -86,6 +87,24 @@ void CapCastSettings::buildUi()
 	audioCombo->setToolTip(QObject::tr(
 		"选择采集卡音频端点(USB 声卡/HDMI 采集卡的音频输出)。自动检测会智能选择非音箱的采集设备"));
 
+	/* 输出音量滑块: 0-200%, 默认 50%。只影响送到采集卡的声音 */
+	volumeSlider = new QSlider(Qt::Horizontal, this);
+	volumeSlider->setRange(0, 200);
+	volumeSlider->setSingleStep(1);
+	volumeSlider->setPageStep(5);
+	volumeSlider->setTickPosition(QSlider::TicksBelow);
+	volumeSlider->setTickInterval(25);
+	volumeSlider->setToolTip(QObject::tr(
+		"送到采集卡的音量。100% = OBS 主混音原始音量, 可往上放大或往下调小。只影响采集卡, 不改 OBS 混音器"));
+
+	volumeLabel = new QLabel(QStringLiteral("50%"), this);
+	volumeLabel->setMinimumWidth(52);
+	volumeLabel->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
+
+	auto *volumeRow = new QHBoxLayout;
+	volumeRow->addWidget(volumeSlider, 1);
+	volumeRow->addWidget(volumeLabel);
+
 	sourceCombo = new QComboBox(this);
 	sourceCombo->addItem(obs_module_text("CapCast.Settings.Source.Program"),
 			     QStringLiteral("program"));
@@ -114,6 +133,8 @@ void CapCastSettings::buildUi()
 	auto *audioForm = new QFormLayout(audioBox);
 	audioForm->addRow(obs_module_text("CapCast.Settings.Audio.Target"),
 			  audioCombo);
+	audioForm->addRow(obs_module_text("CapCast.Settings.Audio.Volume"),
+			  volumeRow);
 
 	auto *outputBox = new QGroupBox(
 		obs_module_text("CapCast.Settings.Group.Output"), this);
@@ -140,6 +161,8 @@ void CapCastSettings::buildUi()
 		&CapCastSettings::onStartClicked);
 	connect(stopBtn, &QPushButton::clicked, this,
 		&CapCastSettings::onStopClicked);
+	connect(volumeSlider, &QSlider::valueChanged, this,
+		&CapCastSettings::onVolumeChanged);
 
 	/* 让字段(下拉框)始终填满整行, 避免被挤压 */
 	displayForm->setFieldGrowthPolicy(QFormLayout::AllNonFixedFieldsGrow);
@@ -151,8 +174,8 @@ void CapCastSettings::buildUi()
 	outputForm->setLabelAlignment(Qt::AlignRight | Qt::AlignVCenter);
 
 	/* 强制最小尺寸, 防止 Qt 按 layout 算出的最小尺寸把窗口缩太窄 */
-	setMinimumSize(460, 320);
-	resize(520, 360);
+	setMinimumSize(460, 350);
+	resize(520, 400);
 }
 
 void CapCastSettings::closeEvent(QCloseEvent *event)
@@ -205,6 +228,11 @@ void CapCastSettings::loadSettings()
 	const QString src = capcast::cfg_source();
 	sourceCombo->setCurrentIndex(src == QStringLiteral("preview") ? 1 : 0);
 
+	/* 输出音量(默认 50%) */
+	const int vol = (int)(capcast::cfg_audio_volume() + 0.5);
+	volumeSlider->setValue(vol);
+	volumeLabel->setText(QStringLiteral("%1%").arg(vol));
+
 	autoStartCheck->setChecked(capcast::cfg_auto_start());
 }
 
@@ -230,6 +258,18 @@ void CapCastSettings::saveSettings()
 	} else {
 		capcast::cfg_set_audio_mode(QStringLiteral("auto"));
 	}
+
+	/* 输出音量(运行时已即时生效, 这里只负责落盘) */
+	capcast::cfg_set_audio_volume((double)volumeSlider->value());
+}
+
+void CapCastSettings::onVolumeChanged(int value)
+{
+	volumeLabel->setText(QStringLiteral("%1%").arg(value));
+
+	/* 推流中拖动即刻改变送到采集卡的音量, 无需重启路由;
+	 * 未推流时也会写入运行时值, 下次开始即生效 */
+	capcast::set_output_volume((double)value);
 }
 
 void CapCastSettings::refreshStatus()
