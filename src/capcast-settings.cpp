@@ -133,6 +133,8 @@ void CapCastSettings::buildUi()
 	btnRow->addStretch(1);
 
 	auto *mainLayout = new QVBoxLayout(this);
+	mainLayout->setContentsMargins(12, 12, 12, 12);
+	mainLayout->setSpacing(8);
 	mainLayout->addWidget(displayBox);
 	mainLayout->addWidget(audioBox);
 	mainLayout->addWidget(outputBox);
@@ -144,7 +146,18 @@ void CapCastSettings::buildUi()
 	connect(stopBtn, &QPushButton::clicked, this,
 		&CapCastSettings::onStopClicked);
 
-	resize(460, 380);
+	/* 让字段(下拉框/输入框)始终填满整行, 避免被挤压 */
+	displayForm->setFieldGrowthPolicy(QFormLayout::AllNonFixedFieldsGrow);
+	audioForm->setFieldGrowthPolicy(QFormLayout::AllNonFixedFieldsGrow);
+	outputForm->setFieldGrowthPolicy(QFormLayout::AllNonFixedFieldsGrow);
+	/* 标签列宽度按内容自适应, 字段列占满剩余 */
+	displayForm->setLabelAlignment(Qt::AlignRight | Qt::AlignVCenter);
+	audioForm->setLabelAlignment(Qt::AlignRight | Qt::AlignVCenter);
+	outputForm->setLabelAlignment(Qt::AlignRight | Qt::AlignVCenter);
+
+	/* 强制最小尺寸, 防止 Qt 按 layout 算出的最小尺寸把窗口缩太窄 */
+	setMinimumSize(540, 460);
+	resize(580, 480);
 }
 
 void CapCastSettings::toggleShowHide()
