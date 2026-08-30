@@ -63,7 +63,7 @@ QString populate_audio_devices(QComboBox *combo, const QString &current_id)
 
 } // namespace
 
-CapCastSettings::CapCastSettings(QWidget *parent) : QWidget(parent)
+CapCastSettings::CapCastSettings(QWidget *parent) : QDialog(parent)
 {
 	buildUi();
 	loadSettings();

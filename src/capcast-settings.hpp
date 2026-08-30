@@ -3,7 +3,7 @@
  */
 #pragma once
 
-#include <QWidget>
+#include <QDialog>
 
 class QComboBox;
 class QLineEdit;
@@ -11,7 +11,7 @@ class QCheckBox;
 class QPushButton;
 class QLabel;
 
-class CapCastSettings : public QWidget {
+class CapCastSettings : public QDialog {
 	Q_OBJECT
 
 public:
