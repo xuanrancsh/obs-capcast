@@ -64,7 +64,12 @@ function(_setup_obs_studio)
   if(OS_WINDOWS)
     set(_cmake_generator "${CMAKE_GENERATOR}")
     set(_cmake_arch "-A ${arch}")
-    set(_cmake_extra "-DCMAKE_SYSTEM_VERSION=${CMAKE_SYSTEM_VERSION} -DCMAKE_ENABLE_SCRIPTING=OFF")
+    # /ALTERNATENAME: obs-deps prebuilt libz.a references __ms_vsnprintf which modern
+    # MSVC ucrt no longer exports; map it to vsnprintf at link time (no source changes).
+    set(_cmake_extra
+        "-DCMAKE_SYSTEM_VERSION=${CMAKE_SYSTEM_VERSION} -DCMAKE_ENABLE_SCRIPTING=OFF"
+        "-DCMAKE_SHARED_LINKER_FLAGS:STRING=/ALTERNATENAME:__ms_vsnprintf=vsnprintf"
+        "-DCMAKE_EXE_LINKER_FLAGS:STRING=/ALTERNATENAME:__ms_vsnprintf=vsnprintf")
     set(_cmake_version "2.0.0")
   elseif(OS_MACOS)
     set(_cmake_generator "Xcode")
@@ -190,21 +195,9 @@ function(_check_dependencies)
       file(MAKE_DIRECTORY "${dependencies_dir}/${destination}")
       if(dependency STREQUAL obs-studio)
         file(ARCHIVE_EXTRACT INPUT "${dependencies_dir}/${file}" DESTINATION "${dependencies_dir}")
-        # Fix: obs-deps prebuilt libz.a (built with old MSVC) references __ms_vsnprintf,
-        # which modern MSVC ucrt (VS2019 16.10+) no longer exports.
-        # Inject a stub source into libobs that aliases __ms_vsnprintf to vsnprintf.
-        file(WRITE "${dependencies_dir}/${destination}/libobs/__ms_vsnprintf_stub.c"
-             "#include <stdarg.h>\nint vsnprintf(char *buf, size_t n, const char *fmt, va_list ap);\nint __ms_vsnprintf(char *buf, size_t n, const char *fmt, va_list ap){return vsnprintf(buf,n,fmt,ap);}\n")
-        # Append a target_sources call at the end of libobs CMakeLists (append is reliable;
-        # string(REPLACE) proved fragile across CMake versions).
-        file(APPEND "${dependencies_dir}/${destination}/libobs/CMakeLists.txt" "\n# [CapCast] __ms_vsnprintf stub for modern MSVC\ntarget_sources(libobs PRIVATE __ms_vsnprintf_stub.c)\n")
-        # Verify injection took effect
-        file(READ "${dependencies_dir}/${destination}/libobs/CMakeLists.txt" _lc_check)
-        string(REPLACE "\r\n" "\n" _lc_check "${_lc_check}")
-        if(NOT _lc_check MATCHES "__ms_vsnprintf_stub")
-          message(FATAL_ERROR "Failed to inject __ms_vsnprintf stub into libobs CMakeLists.txt")
-        endif()
-        message(STATUS "Injected __ms_vsnprintf stub into libobs (verified)")
+        # Note: obs-deps prebuilt libz.a (old MSVC) references __ms_vsnprintf, which
+        # modern MSVC ucrt no longer exports. Handled at link time via
+        # /ALTERNATENAME:__ms_vsnprintf=vsnprintf in _setup_obs_studio.
       else()
         file(ARCHIVE_EXTRACT INPUT "${dependencies_dir}/${file}" DESTINATION "${dependencies_dir}/${destination}")
       endif()
