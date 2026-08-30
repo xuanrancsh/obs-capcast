@@ -37,9 +37,9 @@
         }
     },
     "name": "capcast",
-    "displayName": "CapCast 采集卡一键推流",
+    "displayName": "采集卡一键推流",
     "version": "1.0.0",
-    "website": "https://github.com/capcast/obs-capcast",
+    "website": "https://github.com/xuanrancsh/obs-capcast",
     "author": "CapCast",
     "email": "capcast@example.com",
     "uuids": {
