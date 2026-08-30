@@ -14,6 +14,7 @@
 #include <QGuiApplication>
 #include <QScreen>
 #include <QApplication>
+#include <QWidget>
 
 #ifdef _WIN32
 #include <windows.h>
@@ -212,15 +213,14 @@ CapCastAudioDevice find_audio_device_by_pattern(const QString &pattern)
 /* ================= 一键推流 ================= */
 
 /* 把全部音频源设为"监听并输出", 使音频同时进 OBS 混音和全局监控设备(采集卡) */
-static void set_monitor_all_sources(void *param, obs_source_t *source)
+/* obs 31: 回调返回 bool(继续枚举), 服务源已并入 INPUT 类型无需特判 */
+static bool set_monitor_all_sources(void *param, obs_source_t *source)
 {
 	auto *snapshots = static_cast<QVector<SourceMonitorSnapshot> *>(param);
 	const uint32_t flags = obs_source_get_output_flags(source);
 	/* 只路由有音频输出的源; 跳过辅助/占位源 */
 	if ((flags & OBS_SOURCE_AUDIO) == 0)
-		return;
-	if (obs_source_get_type(source) == OBS_SOURCE_TYPE_SERVICE)
-		return;
+		return true;
 
 	SourceMonitorSnapshot snap;
 	snap.source = source;
@@ -231,6 +231,7 @@ static void set_monitor_all_sources(void *param, obs_source_t *source)
 				       OBS_MONITORING_TYPE_MONITOR_AND_OUTPUT);
 	CAPCAST_LOG(LOG_DEBUG, "monitor source: %s",
 		    obs_source_get_name(source));
+	return true;
 }
 
 bool is_output_active()
