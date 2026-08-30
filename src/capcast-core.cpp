@@ -314,7 +314,7 @@ static struct obs_audio_data *router_filter_audio(void *, struct obs_audio_data 
 
 /* obs_source_info 用零初始化+逐字段赋值(C++17 不支持指定初始化器) */
 static struct obs_source_info capcast_audio_router = {};
-static void capcast_router_register()
+void capcast_router_register()
 {
 	capcast_audio_router.id = "capcast_audio_router";
 	capcast_audio_router.type = OBS_SOURCE_TYPE_FILTER;
