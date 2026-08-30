@@ -56,6 +56,8 @@ function(_check_deps_version version)
 endfunction()
 
 # _setup_obs_studio: Create obs-studio build project, then build libobs and obs-frontend-api
+# Adapted from DistroAV (obs-studio 31.x compatible): OBS_CMAKE_VERSION=3.0.0,
+# build+install BOTH Debug and Release, install Development component (no obs_libraries).
 function(_setup_obs_studio)
   if(NOT libobs_DIR)
     set(_is_fresh --fresh)
@@ -63,14 +65,14 @@ function(_setup_obs_studio)
 
   if(OS_WINDOWS)
     set(_cmake_generator "${CMAKE_GENERATOR}")
-    set(_cmake_arch "-A ${arch}")
-    # /ALTERNATENAME: obs-deps prebuilt libz.a references __ms_vsnprintf which modern
-    # MSVC ucrt no longer exports; map it to vsnprintf at link time (no source changes).
+    set(_cmake_arch "-A ${arch},version=${CMAKE_VS_WINDOWS_TARGET_PLATFORM_VERSION}")
+    # /ALTERNATENAME: old obs-deps libz.a references __ms_vsnprintf which modern MSVC
+    # ucrt no longer exports; map it to vsnprintf at link time (no source changes).
     set(_cmake_extra
         "-DCMAKE_SYSTEM_VERSION=${CMAKE_SYSTEM_VERSION} -DCMAKE_ENABLE_SCRIPTING=OFF"
         "-DCMAKE_SHARED_LINKER_FLAGS:STRING=/ALTERNATENAME:__ms_vsnprintf=vsnprintf"
         "-DCMAKE_EXE_LINKER_FLAGS:STRING=/ALTERNATENAME:__ms_vsnprintf=vsnprintf")
-    set(_cmake_version "2.0.0")
+    set(_cmake_version "3.0.0")
   elseif(OS_MACOS)
     set(_cmake_generator "Xcode")
     set(_cmake_arch "-DCMAKE_OSX_ARCHITECTURES:STRING='arm64;x86_64'")
@@ -83,37 +85,36 @@ function(_setup_obs_studio)
     COMMAND
       "${CMAKE_COMMAND}" -S "${dependencies_dir}/${_obs_destination}" -B
       "${dependencies_dir}/${_obs_destination}/build_${arch}" -G ${_cmake_generator} "${_cmake_arch}"
-      -DOBS_CMAKE_VERSION:STRING=${_cmake_version} -DENABLE_PLUGINS:BOOL=OFF -DENABLE_UI:BOOL=OFF
+      -DOBS_CMAKE_VERSION:STRING=${_cmake_version} -DENABLE_PLUGINS:BOOL=OFF -DENABLE_FRONTEND:BOOL=OFF
       -DOBS_VERSION_OVERRIDE:STRING=${_obs_version} "-DCMAKE_PREFIX_PATH='${CMAKE_PREFIX_PATH}'" ${_is_fresh}
       ${_cmake_extra}
     RESULT_VARIABLE _process_result COMMAND_ERROR_IS_FATAL ANY
     OUTPUT_QUIET)
   message(STATUS "Configure ${label} (${arch}) - done")
 
-  message(STATUS "Build ${label} (${arch})")
-  execute_process(
-    COMMAND "${CMAKE_COMMAND}" --build build_${arch} --target obs-frontend-api --config Debug --parallel
-    WORKING_DIRECTORY "${dependencies_dir}/${_obs_destination}"
-    RESULT_VARIABLE _process_result
-    OUTPUT_VARIABLE _build_out
-    ERROR_VARIABLE _build_err)
-  if(NOT _process_result EQUAL 0)
-    message(FATAL_ERROR "${label} build failed (${arch}):\n${_build_out}\n${_build_err}")
-  endif()
-  message(STATUS "Build ${label} (${arch}) - done")
+  foreach(_cfg Debug Release)
+    message(STATUS "Build ${label} (${_cfg} - ${arch})")
+    execute_process(
+      COMMAND "${CMAKE_COMMAND}" --build build_${arch} --target obs-frontend-api --config ${_cfg} --parallel
+      WORKING_DIRECTORY "${dependencies_dir}/${_obs_destination}"
+      RESULT_VARIABLE _process_result
+      OUTPUT_VARIABLE _build_out
+      ERROR_VARIABLE _build_err)
+    if(NOT _process_result EQUAL 0)
+      message(FATAL_ERROR "${label} build failed (${_cfg} - ${arch}):\n${_build_out}\n${_build_err}")
+    endif()
+    message(STATUS "Build ${label} (${_cfg} - ${arch}) - done")
+  endforeach()
 
   message(STATUS "Install ${label} (${arch})")
-  if(OS_WINDOWS)
-    set(_cmake_extra "--component obs_libraries")
-  else()
-    set(_cmake_extra "")
-  endif()
-  execute_process(
-    COMMAND "${CMAKE_COMMAND}" --install build_${arch} --component Development --config Debug --prefix
-            "${dependencies_dir}" ${_cmake_extra}
-    WORKING_DIRECTORY "${dependencies_dir}/${_obs_destination}"
-    RESULT_VARIABLE _process_result COMMAND_ERROR_IS_FATAL ANY
-    OUTPUT_QUIET)
+  foreach(_cfg Debug Release)
+    execute_process(
+      COMMAND "${CMAKE_COMMAND}" --install build_${arch} --component Development --config ${_cfg} --prefix
+              "${dependencies_dir}"
+      WORKING_DIRECTORY "${dependencies_dir}/${_obs_destination}"
+      RESULT_VARIABLE _process_result COMMAND_ERROR_IS_FATAL ANY
+      OUTPUT_QUIET)
+  endforeach()
   message(STATUS "Install ${label} (${arch}) - done")
 endfunction()
 

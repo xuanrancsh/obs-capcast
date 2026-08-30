@@ -16,7 +16,7 @@
 #include <QVBoxLayout>
 #include <QHBoxLayout>
 #include <QGroupBox>
-#include <QDateTime>
+#include <QApplication>
 
 namespace {
 
