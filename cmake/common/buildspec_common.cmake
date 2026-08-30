@@ -191,17 +191,20 @@ function(_check_dependencies)
       if(dependency STREQUAL obs-studio)
         file(ARCHIVE_EXTRACT INPUT "${dependencies_dir}/${file}" DESTINATION "${dependencies_dir}")
         # Fix: obs-deps prebuilt libz.a (built with old MSVC) references __ms_vsnprintf,
-        # which modern MSVC ucrt (VS2019 16.10+) no longer exports. Inject stub into libobs
-        # that aliases __ms_vsnprintf to standard vsnprintf.
+        # which modern MSVC ucrt (VS2019 16.10+) no longer exports.
+        # Inject a stub source into libobs that aliases __ms_vsnprintf to vsnprintf.
         file(WRITE "${dependencies_dir}/${destination}/libobs/__ms_vsnprintf_stub.c"
-             "#include <stdarg.h>\n#include <stdio.h>\nint __ms_vsnprintf(char *buf, size_t n, const char *fmt, va_list ap){return vsnprintf(buf,n,fmt,ap);}\n")
-        file(READ "${dependencies_dir}/${destination}/libobs/CMakeLists.txt" _lc)
-        string(REPLACE
-          "  PRIVATE # cmake-format: sortable"
-          "  PRIVATE # cmake-format: sortable\n          __ms_vsnprintf_stub.c"
-          _lc "${_lc}")
-        file(WRITE "${dependencies_dir}/${destination}/libobs/CMakeLists.txt" "${_lc}")
-        message(STATUS "Injected __ms_vsnprintf stub into libobs")
+             "#include <stdarg.h>\nint vsnprintf(char *buf, size_t n, const char *fmt, va_list ap);\nint __ms_vsnprintf(char *buf, size_t n, const char *fmt, va_list ap){return vsnprintf(buf,n,fmt,ap);}\n")
+        # Append a target_sources call at the end of libobs CMakeLists (append is reliable;
+        # string(REPLACE) proved fragile across CMake versions).
+        file(APPEND "${dependencies_dir}/${destination}/libobs/CMakeLists.txt" "\n# [CapCast] __ms_vsnprintf stub for modern MSVC\ntarget_sources(libobs PRIVATE __ms_vsnprintf_stub.c)\n")
+        # Verify injection took effect
+        file(READ "${dependencies_dir}/${destination}/libobs/CMakeLists.txt" _lc_check)
+        string(REPLACE "\r\n" "\n" _lc_check "${_lc_check}")
+        if(NOT _lc_check MATCHES "__ms_vsnprintf_stub")
+          message(FATAL_ERROR "Failed to inject __ms_vsnprintf stub into libobs CMakeLists.txt")
+        endif()
+        message(STATUS "Injected __ms_vsnprintf stub into libobs (verified)")
       else()
         file(ARCHIVE_EXTRACT INPUT "${dependencies_dir}/${file}" DESTINATION "${dependencies_dir}/${destination}")
       endif()
