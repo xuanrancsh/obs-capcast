@@ -39,15 +39,7 @@ static void resolve_and_start()
 	if (capcast::cfg_display_mode() == QStringLiteral("manual")) {
 		screen_index = capcast::cfg_display_index();
 	} else {
-		screen_index = capcast::find_screen_by_pattern(
-			capcast::cfg_display_pattern());
-		if (screen_index < 0 && capcast::cfg_auto_extend()) {
-			if (capcast::ensure_display_extend()) {
-				QApplication::processEvents();
-				screen_index = capcast::find_screen_by_pattern(
-					capcast::cfg_display_pattern());
-			}
-		}
+		screen_index = capcast::pick_default_screen();
 	}
 
 	/* 解析目标音频设备 */
@@ -55,9 +47,7 @@ static void resolve_and_start()
 	if (capcast::cfg_audio_mode() == QStringLiteral("manual")) {
 		audio_id = capcast::cfg_audio_device_id();
 	} else {
-		audio_id = capcast::find_audio_device_by_pattern(
-					  capcast::cfg_audio_pattern())
-				   .id;
+		audio_id = capcast::pick_default_audio().id;
 	}
 
 	const CapCastProjectorSource src =
@@ -108,17 +98,21 @@ static void frontend_event(enum obs_frontend_event event, void *)
 
 /* ================= 模块入口 ================= */
 
+/* 注册音频路由过滤器源类型(在 capcast-core.cpp 定义) */
+extern struct obs_source_info capcast_audio_router;
+
 bool obs_module_load(void)
 {
 	blog(LOG_INFO, "%s %s loaded", PLUGIN_DISPLAY_NAME, PLUGIN_VERSION);
 
+	/* 注册音频路由过滤器(直接软路由到采集卡) */
+	obs_register_source(&capcast_audio_router);
+
 	/* 默认配置(首次运行时写入) */
-	if (capcast::cfg_display_pattern().isEmpty())
-		capcast::cfg_set_display_pattern(QStringLiteral("capture"));
-	if (capcast::cfg_audio_pattern().isEmpty())
-		capcast::cfg_set_audio_pattern(QStringLiteral("capture"));
 	if (capcast::cfg_source().isEmpty())
 		capcast::cfg_set_source(QStringLiteral("program"));
+	if (!capcast::cfg_auto_start())
+		capcast::cfg_set_auto_start(false);
 
 	/* 工具菜单: 设置面板 */
 	QMainWindow *main_window =

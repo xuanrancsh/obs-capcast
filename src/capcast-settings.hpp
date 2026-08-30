@@ -6,10 +6,10 @@
 #include <QDialog>
 
 class QComboBox;
-class QLineEdit;
 class QCheckBox;
 class QPushButton;
 class QLabel;
+class QCloseEvent;
 
 class CapCastSettings : public QDialog {
 	Q_OBJECT
@@ -32,13 +32,11 @@ private:
 	void loadSettings();
 	void saveSettings();
 	void refreshStatus();
+	void closeEvent(QCloseEvent *event) override; /* 关闭时自动保存 */
 
 	QComboBox *displayCombo = nullptr;
-	QLineEdit *displayPatternEdit = nullptr;
 	QComboBox *audioCombo = nullptr;
-	QLineEdit *audioPatternEdit = nullptr;
 	QComboBox *sourceCombo = nullptr;
-	QCheckBox *autoExtendCheck = nullptr;
 	QCheckBox *autoStartCheck = nullptr;
 	QPushButton *startBtn = nullptr;
 	QPushButton *stopBtn = nullptr;

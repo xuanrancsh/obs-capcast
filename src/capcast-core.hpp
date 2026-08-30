@@ -2,10 +2,11 @@
  * capcast-core.hpp - CapCast 采集卡一键推流插件 核心逻辑
  *
  * 职责：
- *   1. 采集卡副屏识别（Qt screens 枚举 + 名称匹配）+ 可选自动扩展显示（SetDisplayConfig）
- *   2. 采集卡音频端点识别（WASAPI 枚举 + 名称匹配）
- *   3. 一键推流：全屏投影(obs_frontend_open_projector) + 全部音频路由到采集卡(audio_monitor)
- *   4. 配置持久化（OBS user config, 段名 "CapCast"）
+ *   1. 采集卡副屏识别（Qt screens 枚举 + 智能选择）
+ *   2. 采集卡音频端点识别（WASAPI 枚举 + 智能选择）
+ *   3. 一键推流：全屏投影(obs_frontend_open_projector) +
+ *                直接软路由全部音频到采集卡(WASAPI 直出, 绕开 OBS 混音器)
+ *   4. 配置持久化（OBS user config, 段名 "CapCast", 每次写入即保存）
  */
 #pragma once
 
@@ -40,8 +41,8 @@ namespace capcast {
 /* 枚举当前所有屏幕(与 OBS 投影编号一致: 0 起) */
 QVector<CapCastScreen> enum_screens();
 
-/* 按名称子串匹配采集卡屏幕; 返回 Qt 屏幕序号, 找不到返回 -1 */
-int find_screen_by_pattern(const QString &pattern);
+/* 自动选择"最像采集卡的副屏": 关键字优先, 兜底第一个非主屏; 无副屏返回 -1 */
+int pick_default_screen();
 
 /* 强制 Windows 显示模式为"扩展"(不动主屏、不复制), 用于把采集卡点亮成副屏 */
 bool ensure_display_extend();
@@ -51,20 +52,22 @@ bool ensure_display_extend();
 /* 枚举全部活动中的 WASAPI 渲染(输出)端点 */
 QVector<CapCastAudioDevice> enum_audio_devices();
 
-/* 按名称子串匹配采集卡音频端点; 返回匹配设备, 找不到返回空 */
-CapCastAudioDevice find_audio_device_by_pattern(const QString &pattern);
+/* 自动选择"最像采集卡的音频端点": 关键字优先, 兜底第一个非音箱设备 */
+CapCastAudioDevice pick_default_audio();
 
 /* ---------- 一键推流 ---------- */
 
 /* 当前是否处于"推流中"(投影已开 / 音频已路由) */
 bool is_output_active();
 
-/* 一键开始: 打开全屏投影 + 全部音频路由到采集卡 */
-/* 返回错误描述, 成功返回空串 */
+/* 一键开始: 打开全屏投影 + 直接软路由全部音频到采集卡
+ *   audio_device_id 为空时由 pick_default_audio() 自动选择
+ *   返回错误描述, 成功返回空串
+ */
 QString start_output(int screen_index, const QString &audio_device_id,
 		     CapCastProjectorSource source);
 
-/* 一键停止: 关闭全屏投影窗口 + 销毁音频路由 */
+/* 一键停止: 关闭全屏投影窗口 + 移除音频路由过滤器 + 释放 WASAPI */
 void stop_output();
 
 /* 关闭所有 OBS 全屏投影窗口(尽力而为) */
@@ -76,23 +79,16 @@ QString cfg_display_mode();                 /* "auto" | "manual" */
 void cfg_set_display_mode(const QString &m);
 int cfg_display_index();                    /* 手动指定屏幕序号 */
 void cfg_set_display_index(int idx);
-QString cfg_display_pattern();              /* 自动匹配名称子串 */
-void cfg_set_display_pattern(const QString &p);
 
 QString cfg_audio_mode();                   /* "auto" | "manual" */
-void cfg_set_audio_mode(const QString &m);
 QString cfg_audio_device_id();              /* 手动指定音频设备 ID */
 QString cfg_audio_device_name();
 void cfg_set_audio_device(const QString &name, const QString &id);
-QString cfg_audio_pattern();
-void cfg_set_audio_pattern(const QString &p);
 
 QString cfg_source();                       /* "program" | "preview" */
 void cfg_set_source(const QString &s);
 
-bool cfg_auto_extend();                     /* 找不到副屏时自动扩展显示 */
-void cfg_set_auto_extend(bool v);
-bool cfg_auto_start();                      /* OBS 启动时自动开始 */
+bool cfg_auto_start();                      /* 随 OBS 启动自动开始推流 */
 void cfg_set_auto_start(bool v);
 
 } // namespace capcast

@@ -8,7 +8,6 @@
 #include <obs-frontend-api.h>
 
 #include <QComboBox>
-#include <QLineEdit>
 #include <QCheckBox>
 #include <QPushButton>
 #include <QLabel>
@@ -17,6 +16,8 @@
 #include <QHBoxLayout>
 #include <QGroupBox>
 #include <QApplication>
+#include <QCloseEvent>
+#include <QToolTip>
 
 namespace {
 
@@ -24,7 +25,7 @@ namespace {
 int populate_screens(QComboBox *combo, int current_index)
 {
 	combo->clear();
-	combo->addItem(QObject::tr("自动检测（按名称匹配）"), -1);
+	combo->addItem(QObject::tr("自动检测"), -1);
 
 	int select_row = 0;
 	const auto screens = capcast::enum_screens();
@@ -47,7 +48,7 @@ int populate_screens(QComboBox *combo, int current_index)
 QString populate_audio_devices(QComboBox *combo, const QString &current_id)
 {
 	combo->clear();
-	combo->addItem(QObject::tr("自动检测（按名称匹配）"), QString());
+	combo->addItem(QObject::tr("自动检测"), QString());
 
 	int select_row = 0;
 	const auto devices = capcast::enum_audio_devices();
@@ -74,17 +75,16 @@ CapCastSettings::CapCastSettings(QWidget *parent) : QDialog(parent)
 void CapCastSettings::buildUi()
 {
 	setWindowTitle(obs_module_text("CapCast.Settings.Title"));
+	setWindowFlags(Qt::Window);
 	setAttribute(Qt::WA_DeleteOnClose, false);
 
 	displayCombo = new QComboBox(this);
-	displayPatternEdit = new QLineEdit(this);
-	displayPatternEdit->setPlaceholderText(
-		obs_module_text("CapCast.Settings.DisplayPattern.Placeholder"));
+	displayCombo->setToolTip(QObject::tr(
+		"选择采集卡副屏。自动检测会优先选名称含采集卡关键字的副屏, 否则选第一个非主屏"));
 
 	audioCombo = new QComboBox(this);
-	audioPatternEdit = new QLineEdit(this);
-	audioPatternEdit->setPlaceholderText(
-		obs_module_text("CapCast.Settings.AudioPattern.Placeholder"));
+	audioCombo->setToolTip(QObject::tr(
+		"选择采集卡音频端点(USB 声卡/HDMI 采集卡的音频输出)。自动检测会智能选择非音箱的采集设备"));
 
 	sourceCombo = new QComboBox(this);
 	sourceCombo->addItem(obs_module_text("CapCast.Settings.Source.Program"),
@@ -92,10 +92,10 @@ void CapCastSettings::buildUi()
 	sourceCombo->addItem(obs_module_text("CapCast.Settings.Source.Preview"),
 			     QStringLiteral("preview"));
 
-	autoExtendCheck = new QCheckBox(
-		obs_module_text("CapCast.Settings.AutoExtend"), this);
 	autoStartCheck = new QCheckBox(
 		obs_module_text("CapCast.Settings.AutoStart"), this);
+	autoStartCheck->setToolTip(QObject::tr(
+		"勾选后, OBS 启动完成时自动开始投屏和音频路由"));
 
 	startBtn = new QPushButton(
 		obs_module_text("CapCast.Settings.Start"), this);
@@ -108,23 +108,18 @@ void CapCastSettings::buildUi()
 	auto *displayForm = new QFormLayout(displayBox);
 	displayForm->addRow(obs_module_text("CapCast.Settings.Display.Target"),
 			    displayCombo);
-	displayForm->addRow(obs_module_text("CapCast.Settings.Display.Pattern"),
-			    displayPatternEdit);
 
 	auto *audioBox = new QGroupBox(
 		obs_module_text("CapCast.Settings.Group.Audio"), this);
 	auto *audioForm = new QFormLayout(audioBox);
 	audioForm->addRow(obs_module_text("CapCast.Settings.Audio.Target"),
 			  audioCombo);
-	audioForm->addRow(obs_module_text("CapCast.Settings.Audio.Pattern"),
-			  audioPatternEdit);
 
 	auto *outputBox = new QGroupBox(
 		obs_module_text("CapCast.Settings.Group.Output"), this);
 	auto *outputForm = new QFormLayout(outputBox);
 	outputForm->addRow(obs_module_text("CapCast.Settings.Source"),
 			   sourceCombo);
-	outputForm->addRow(QString(), autoExtendCheck);
 	outputForm->addRow(QString(), autoStartCheck);
 
 	auto *btnRow = new QHBoxLayout;
@@ -146,7 +141,7 @@ void CapCastSettings::buildUi()
 	connect(stopBtn, &QPushButton::clicked, this,
 		&CapCastSettings::onStopClicked);
 
-	/* 让字段(下拉框/输入框)始终填满整行, 避免被挤压 */
+	/* 让字段(下拉框)始终填满整行, 避免被挤压 */
 	displayForm->setFieldGrowthPolicy(QFormLayout::AllNonFixedFieldsGrow);
 	audioForm->setFieldGrowthPolicy(QFormLayout::AllNonFixedFieldsGrow);
 	outputForm->setFieldGrowthPolicy(QFormLayout::AllNonFixedFieldsGrow);
@@ -156,13 +151,21 @@ void CapCastSettings::buildUi()
 	outputForm->setLabelAlignment(Qt::AlignRight | Qt::AlignVCenter);
 
 	/* 强制最小尺寸, 防止 Qt 按 layout 算出的最小尺寸把窗口缩太窄 */
-	setMinimumSize(540, 460);
-	resize(580, 480);
+	setMinimumSize(460, 320);
+	resize(520, 360);
+}
+
+void CapCastSettings::closeEvent(QCloseEvent *event)
+{
+	/* 关闭窗口时保存当前设置, 下次打开保持 */
+	saveSettings();
+	event->accept();
 }
 
 void CapCastSettings::toggleShowHide()
 {
 	if (isVisible()) {
+		saveSettings();
 		hide();
 	} else {
 		refreshDevices();
@@ -184,23 +187,30 @@ void CapCastSettings::refreshDevices()
 
 void CapCastSettings::loadSettings()
 {
-	displayCombo->setCurrentIndex(-1);
-	displayPatternEdit->setText(capcast::cfg_display_pattern());
-	audioPatternEdit->setText(capcast::cfg_audio_pattern());
+	/* 显示目标: 手动 index 或自动 */
+	if (capcast::cfg_display_mode() == QStringLiteral("manual")) {
+		populate_screens(displayCombo, capcast::cfg_display_index());
+	} else {
+		populate_screens(displayCombo, -1);
+	}
+
+	/* 音频目标: 手动设备 id 或自动 */
+	if (capcast::cfg_audio_mode() == QStringLiteral("manual")) {
+		populate_audio_devices(audioCombo,
+				       capcast::cfg_audio_device_id());
+	} else {
+		populate_audio_devices(audioCombo, QString());
+	}
 
 	const QString src = capcast::cfg_source();
 	sourceCombo->setCurrentIndex(src == QStringLiteral("preview") ? 1 : 0);
 
-	autoExtendCheck->setChecked(capcast::cfg_auto_extend());
 	autoStartCheck->setChecked(capcast::cfg_auto_start());
 }
 
 void CapCastSettings::saveSettings()
 {
-	capcast::cfg_set_display_pattern(displayPatternEdit->text().trimmed());
-	capcast::cfg_set_audio_pattern(audioPatternEdit->text().trimmed());
 	capcast::cfg_set_source(sourceCombo->currentData().toString());
-	capcast::cfg_set_auto_extend(autoExtendCheck->isChecked());
 	capcast::cfg_set_auto_start(autoStartCheck->isChecked());
 
 	/* 显示目标 */
@@ -245,8 +255,7 @@ void CapCastSettings::refreshStatus()
 			}
 		}
 	} else {
-		const int found = capcast::find_screen_by_pattern(
-			displayPatternEdit->text());
+		const int found = capcast::pick_default_screen();
 		text += QStringLiteral("\n[%1] %2")
 				.arg(obs_module_text("CapCast.Status.Display"),
 				     found >= 0
@@ -261,8 +270,7 @@ void CapCastSettings::refreshStatus()
 				.arg(obs_module_text("CapCast.Status.Audio"),
 				     audioCombo->currentText());
 	} else {
-		const auto dev = capcast::find_audio_device_by_pattern(
-			audioPatternEdit->text());
+		const auto dev = capcast::pick_default_audio();
 		text += QStringLiteral("\n[%1] %2")
 				.arg(obs_module_text("CapCast.Status.Audio"),
 				     dev.name.isEmpty()
@@ -278,36 +286,15 @@ void CapCastSettings::onStartClicked()
 	saveSettings();
 	refreshDevices();
 
-	int screen_index = -1;
-
 	/* 1. 解析目标屏幕 */
-	if (displayCombo->currentData().toInt() >= 0) {
-		screen_index = displayCombo->currentData().toInt();
-	} else {
-		screen_index = capcast::find_screen_by_pattern(
-			displayPatternEdit->text());
-		/* 2. 自动模式下找不到 -> 按配置尝试点亮副屏(扩展显示) */
-		if (screen_index < 0 && autoExtendCheck->isChecked()) {
-			statusLabel->setText(
-				obs_module_text("CapCast.Status.Extending"));
-			if (capcast::ensure_display_extend()) {
-				QApplication::processEvents();
-				refreshDevices();
-				screen_index = capcast::find_screen_by_pattern(
-					displayPatternEdit->text());
-			}
-		}
-	}
+	int screen_index = displayCombo->currentData().toInt();
+	if (screen_index < 0)
+		screen_index = capcast::pick_default_screen();
 
-	/* 3. 解析目标音频设备 */
-	QString audio_id;
-	if (!audioCombo->currentData().toString().isEmpty()) {
-		audio_id = audioCombo->currentData().toString();
-	} else {
-		const auto dev = capcast::find_audio_device_by_pattern(
-			audioPatternEdit->text());
-		audio_id = dev.id;
-	}
+	/* 2. 解析目标音频设备 */
+	QString audio_id = audioCombo->currentData().toString();
+	if (audio_id.isEmpty())
+		audio_id = capcast::pick_default_audio().id;
 
 	const CapCastProjectorSource src =
 		(sourceCombo->currentData().toString() ==
