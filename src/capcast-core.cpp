@@ -142,8 +142,14 @@ QVector<CapCastAudioDevice> enum_audio_devices()
 	if (FAILED(hrInit) && hrInit != RPC_E_CHANGED_MODE)
 		return out;
 
+	/* CLSID_MMDeviceEnumerator 本地定义(BCDE0395-E52F-467C-8E3D-C4579291692E),
+	 * 避免依赖 uuid.lib 的符号解析(现代 SDK 该符号不在默认链接库中) */
+	static const GUID CLSID_MMDeviceEnumerator_Local = {
+		0xBCDE0395, 0xE52F, 0x467C,
+		{0x8E, 0x3D, 0xC4, 0x57, 0x92, 0x91, 0x69, 0x2E}};
+
 	IMMDeviceEnumerator *enumerator = nullptr;
-	HRESULT hr = CoCreateInstance(CLSID_MMDeviceEnumerator, nullptr,
+	HRESULT hr = CoCreateInstance(CLSID_MMDeviceEnumerator_Local, nullptr,
 				      CLSCTX_ALL, IID_PPV_ARGS(&enumerator));
 	if (SUCCEEDED(hr) && enumerator) {
 		IMMDeviceCollection *coll = nullptr;
