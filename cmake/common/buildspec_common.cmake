@@ -190,6 +190,19 @@ function(_check_dependencies)
       file(MAKE_DIRECTORY "${dependencies_dir}/${destination}")
       if(dependency STREQUAL obs-studio)
         file(ARCHIVE_EXTRACT INPUT "${dependencies_dir}/${file}" DESTINATION "${dependencies_dir}")
+        # Patch obs-studio bundled zlib: replace removed MSVC symbol __ms_vsnprintf
+        # with standard vsnprintf so it links on modern MSVC (VS2022+).
+        file(GLOB _zlib_src_files
+             "${dependencies_dir}/${_obs_destination}/deps/zlib-src/*.c"
+             "${dependencies_dir}/${_obs_destination}/deps/zlib-src/*.h")
+        foreach(_zf ${_zlib_src_files})
+          file(READ "${_zf}" _zc)
+          if(_zc MATCHES "__ms_vsnprintf")
+            string(REPLACE "__ms_vsnprintf" "vsnprintf" _zc "${_zc}")
+            file(WRITE "${_zf}" "${_zc}")
+            message(STATUS "Patched zlib symbol in ${_zf}")
+          endif()
+        endforeach()
       else()
         file(ARCHIVE_EXTRACT INPUT "${dependencies_dir}/${file}" DESTINATION "${dependencies_dir}/${destination}")
       endif()
