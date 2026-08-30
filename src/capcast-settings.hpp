@@ -28,6 +28,7 @@ private slots:
 	void onStartClicked();
 	void onStopClicked();
 	void onVolumeChanged(int value);
+	void onTrackChanged(int index);
 
 private:
 	void buildUi();
@@ -38,6 +39,7 @@ private:
 
 	QComboBox *displayCombo = nullptr;
 	QComboBox *audioCombo = nullptr;
+	QComboBox *trackCombo = nullptr;
 	QComboBox *sourceCombo = nullptr;
 	QSlider *volumeSlider = nullptr;
 	QLabel *volumeLabel = nullptr;

@@ -105,6 +105,13 @@ void CapCastSettings::buildUi()
 	volumeRow->addWidget(volumeSlider, 1);
 	volumeRow->addWidget(volumeLabel);
 
+	/* 订阅音轨: 只把勾选了该音轨的源送到采集卡(默认音轨 1) */
+	trackCombo = new QComboBox(this);
+	for (int t = 1; t <= 6; ++t)
+		trackCombo->addItem(QObject::tr("音轨 %1").arg(t), t);
+	trackCombo->setToolTip(QObject::tr(
+		"只把勾选了这条音轨的源送到采集卡。默认音轨 1 —— 若某个源在 OBS 混音器的高级音频属性里没有勾选音轨 1, 采集卡那边就听不到它。推流中切换立即生效"));
+
 	sourceCombo = new QComboBox(this);
 	sourceCombo->addItem(obs_module_text("CapCast.Settings.Source.Program"),
 			     QStringLiteral("program"));
@@ -135,6 +142,8 @@ void CapCastSettings::buildUi()
 			  audioCombo);
 	audioForm->addRow(obs_module_text("CapCast.Settings.Audio.Volume"),
 			  volumeRow);
+	audioForm->addRow(obs_module_text("CapCast.Settings.Audio.Track"),
+			  trackCombo);
 
 	auto *outputBox = new QGroupBox(
 		obs_module_text("CapCast.Settings.Group.Output"), this);
@@ -163,6 +172,8 @@ void CapCastSettings::buildUi()
 		&CapCastSettings::onStopClicked);
 	connect(volumeSlider, &QSlider::valueChanged, this,
 		&CapCastSettings::onVolumeChanged);
+	connect(trackCombo, QOverload<int>::of(&QComboBox::currentIndexChanged),
+		this, &CapCastSettings::onTrackChanged);
 
 	/* 让字段(下拉框)始终填满整行, 避免被挤压 */
 	displayForm->setFieldGrowthPolicy(QFormLayout::AllNonFixedFieldsGrow);
@@ -174,8 +185,8 @@ void CapCastSettings::buildUi()
 	outputForm->setLabelAlignment(Qt::AlignRight | Qt::AlignVCenter);
 
 	/* 强制最小尺寸, 防止 Qt 按 layout 算出的最小尺寸把窗口缩太窄 */
-	setMinimumSize(460, 350);
-	resize(520, 400);
+	setMinimumSize(460, 385);
+	resize(520, 430);
 }
 
 void CapCastSettings::closeEvent(QCloseEvent *event)
@@ -233,6 +244,11 @@ void CapCastSettings::loadSettings()
 	volumeSlider->setValue(vol);
 	volumeLabel->setText(QStringLiteral("%1%").arg(vol));
 
+	/* 订阅音轨(默认 1) */
+	const int track = capcast::cfg_audio_track();
+	const int track_row = trackCombo->findData(track);
+	trackCombo->setCurrentIndex(track_row >= 0 ? track_row : 0);
+
 	autoStartCheck->setChecked(capcast::cfg_auto_start());
 }
 
@@ -261,6 +277,9 @@ void CapCastSettings::saveSettings()
 
 	/* 输出音量(运行时已即时生效, 这里只负责落盘) */
 	capcast::cfg_set_audio_volume((double)volumeSlider->value());
+
+	/* 订阅音轨(运行时已即时切换, 这里只负责落盘) */
+	capcast::cfg_set_audio_track(trackCombo->currentData().toInt());
 }
 
 void CapCastSettings::onVolumeChanged(int value)
@@ -270,6 +289,14 @@ void CapCastSettings::onVolumeChanged(int value)
 	/* 推流中拖动即刻改变送到采集卡的音量, 无需重启路由;
 	 * 未推流时也会写入运行时值, 下次开始即生效 */
 	capcast::set_output_volume((double)value);
+}
+
+void CapCastSettings::onTrackChanged(int)
+{
+	const int track = trackCombo->currentData().toInt();
+
+	/* 推流中切换立即重新订阅; 未推流时只记录, 下次开始生效 */
+	capcast::apply_audio_track(track);
 }
 
 void CapCastSettings::refreshStatus()

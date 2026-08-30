@@ -61,6 +61,21 @@ OutputState g_state;
  * 音频线程(on_master_audio)读取, UI 线程(设置面板)写入, 故用 atomic。 */
 std::atomic<double> g_volume_pct{50.0};
 
+/* 当前订阅的 mix 索引(= 音轨 - 1)。
+ * obs_remove_raw_audio_callback 必须用与订阅时相同的 mix_idx 才能移除成功,
+ * 因此把它存下来, 避免运行期间改了配置导致取消订阅失败(音频关不掉)。 */
+std::atomic<int> g_mix_idx{0};
+
+/* 音轨(1-6) -> OBS mix 索引(0-5) */
+size_t mix_index_from_track(int track)
+{
+	if (track < 1)
+		track = 1;
+	if ((size_t)track > MAX_AUDIO_MIXES)
+		track = (int)MAX_AUDIO_MIXES;
+	return (size_t)(track - 1);
+}
+
 /* 与 OBS 自身一致的日志宏 */
 #define CAPCAST_LOG(level, fmt, ...) \
 	blog(level, "[CapCast] " fmt, ##__VA_ARGS__)
@@ -486,6 +501,11 @@ static QString start_audio_routing(const QString &device_id)
 	g_volume_pct.store(capcast::cfg_audio_volume(),
 			   std::memory_order_relaxed);
 
+	/* 载入订阅音轨(默认 1 -> mix 索引 0) */
+	const int track = capcast::cfg_audio_track();
+	g_mix_idx.store((int)mix_index_from_track(track),
+			std::memory_order_relaxed);
+
 	/* 让 OBS 直接用采集卡端点的采样率/声道把主混音转换成交错 float32,
 	 * 插件只做最后一次"float -> 设备原始格式"的落格式。
 	 * 这样混音、重采样、声道映射全部由 OBS 音频引擎负责。 */
@@ -494,10 +514,12 @@ static QString start_audio_routing(const QString &device_id)
 	conv.format = AUDIO_FORMAT_FLOAT;
 	conv.speakers = layout_from_channels(g_wasapi.channels);
 	conv.allow_clipping = true;
-	obs_add_raw_audio_callback(0, &conv, on_master_audio, nullptr);
+	obs_add_raw_audio_callback((size_t)g_mix_idx.load(std::memory_order_relaxed),
+				   &conv, on_master_audio, nullptr);
 
 	CAPCAST_LOG(LOG_INFO,
-		    "audio routing started: master mix -> %s (%uHz %uch %ubit%s), volume %.0f%%",
+		    "audio routing started: mix %d (track %d) -> %s (%uHz %uch %ubit%s), volume %.0f%%",
+		    g_mix_idx.load(std::memory_order_relaxed), track,
 		    qUtf8Printable(dev_id), g_wasapi.sample_rate,
 		    g_wasapi.channels, g_wasapi.dev_bits,
 		    g_wasapi.dev_float ? " float" : " int",
@@ -512,9 +534,13 @@ static QString start_audio_routing(const QString &device_id)
 static void stop_audio_routing()
 {
 #ifdef _WIN32
-	obs_remove_raw_audio_callback(0, on_master_audio, nullptr);
+	/* 必须用与订阅时相同的 mix 索引, 否则取消订阅失败(表现为停不下来) */
+	obs_remove_raw_audio_callback(
+		(size_t)g_mix_idx.load(std::memory_order_relaxed),
+		on_master_audio, nullptr);
 	wasapi_shutdown();
-	CAPCAST_LOG(LOG_INFO, "audio routing stopped");
+	CAPCAST_LOG(LOG_INFO, "audio routing stopped (mix %d)",
+		    g_mix_idx.load(std::memory_order_relaxed));
 #endif
 }
 
@@ -765,10 +791,18 @@ void stop_output()
 
 void close_projector_windows()
 {
+	/* 只在 Qt 应用实例仍存活时执行。
+	 * 退出/卸载阶段 OBS 正在销毁主窗口与投影窗口, 此时遍历或 close()
+	 * QWidget 会让 Qt 把事件派发到已析构的对象上, 直接崩溃
+	 * (崩溃栈: obs_module_unload -> qt6core x2 -> 无效堆地址, 即虚调用
+	 * 打到了被释放对象的 vtable)。 */
+	if (!qApp)
+		return;
+
 	/* OBS 全屏投影是 OBSProjector(QDialog) 顶层窗口, 通过类名定位并关闭 */
 	const QWidgetList widgets = QApplication::topLevelWidgets();
 	for (QWidget *w : widgets) {
-		if (w->inherits("OBSProjector")) {
+		if (w && w->inherits("OBSProjector")) {
 			CAPCAST_LOG(LOG_INFO, "closing projector window");
 			w->close();
 		}
@@ -848,6 +882,70 @@ void set_output_volume(double percent)
 	/* 仅运行时生效: 音频线程下一次回调就会用新的增益, 无需重启路由。
 	 * 不在此处落盘 —— 拖动滑块会高频触发, 持久化交给设置面板保存时做。 */
 	g_volume_pct.store(percent, std::memory_order_relaxed);
+}
+
+int cfg_audio_track()
+{
+	const int t =
+		(int)config_get_int(user_config(), CFG_SECTION, "AudioTrack");
+	/* 未设置过或值非法 -> 默认音轨 1 */
+	if (t < 1 || (size_t)t > MAX_AUDIO_MIXES)
+		return 1;
+	return t;
+}
+void cfg_set_audio_track(int track)
+{
+	config_set_int(user_config(), CFG_SECTION, "AudioTrack", track);
+	cfg_flush();
+}
+
+void apply_audio_track(int track)
+{
+#ifdef _WIN32
+	if (!g_wasapi.active)
+		return; /* 未运行: 下次开始时生效 */
+
+	const size_t new_mix = mix_index_from_track(track);
+	const size_t old_mix =
+		(size_t)g_mix_idx.load(std::memory_order_relaxed);
+	if (new_mix == old_mix)
+		return;
+
+	/* 先用原索引取消订阅, 再按新索引重新订阅 */
+	obs_remove_raw_audio_callback(old_mix, on_master_audio, nullptr);
+	g_mix_idx.store((int)new_mix, std::memory_order_relaxed);
+
+	if (obs_get_audio()) {
+		struct audio_convert_info conv{};
+		conv.samples_per_sec = g_wasapi.sample_rate;
+		conv.format = AUDIO_FORMAT_FLOAT;
+		conv.speakers = layout_from_channels(g_wasapi.channels);
+		conv.allow_clipping = true;
+		obs_add_raw_audio_callback(new_mix, &conv, on_master_audio,
+					   nullptr);
+	}
+	CAPCAST_LOG(LOG_INFO, "audio track switched: mix %d -> mix %d",
+		    (int)old_mix, (int)new_mix);
+#else
+	Q_UNUSED(track);
+#endif
+}
+
+void stop_audio_only()
+{
+	/* 只停音频并释放自有资源, 不触碰任何 Qt 窗口(原因见头文件注释)。
+	 *
+	 * 注意: 卸载时调用 obs_remove_raw_audio_callback 是安全的 ——
+	 * obs_shutdown() 的执行顺序是 stop_video() -> stop_audio() ->
+	 * stop_hotkeys() -> free_module(), 即音频子系统先于模块卸载被销毁;
+	 * stop_audio() 会把 obs->audio.audio 置 NULL, 而
+	 * audio_output_disconnect() 开头就有 `if (!audio) return;`,
+	 * 因此这里的取消订阅会直接空操作返回, 不会踩空指针。
+	 * (audio_output_close() 也已经把我们的回调连接一并释放了。)
+	 *
+	 * 投影窗口则由 OBS 自己在退出时销毁。 */
+	stop_audio_routing();
+	g_state.active = false;
 }
 
 QString cfg_source()

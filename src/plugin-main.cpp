@@ -16,18 +16,22 @@
 #include <QMainWindow>
 #include <QAction>
 #include <QApplication>
+#include <QPointer>
 
 OBS_DECLARE_MODULE()
 OBS_MODULE_USE_DEFAULT_LOCALE(PLUGIN_NAME, "en-US")
 
-static CapCastSettings *g_settings = nullptr;
+/* 用 QPointer 保存: 设置对话框是 OBS 主窗口的子对象, 退出时可能被 OBS
+ * 先一步销毁。QPointer 会在对象被销毁后自动置空, 避免我们持有悬垂指针
+ * 并二次 delete(双重析构 -> 调用已释放对象的虚析构 -> 崩溃)。 */
+static QPointer<CapCastSettings> g_settings;
 static obs_hotkey_id g_hotkey_id = OBS_INVALID_HOTKEY_ID;
 
 /* ================= 工具菜单 ================= */
 
 static void open_settings_menu()
 {
-	if (g_settings)
+	if (!g_settings.isNull())
 		g_settings->toggleShowHide();
 }
 
@@ -153,17 +157,25 @@ void obs_module_unload(void)
 		g_hotkey_id = OBS_INVALID_HOTKEY_ID;
 	}
 
-	/* 3. 停止投屏与音频路由(移除场景上的过滤器 + 释放 WASAPI) */
-	capcast::stop_output();
+	/* 3. 只停止音频路由并释放 WASAPI, 绝不触碰 Qt 控件。
+	 *
+	 *    这里原来是 capcast::stop_output(), 它会走 close_projector_windows()
+	 *    去遍历 QApplication::topLevelWidgets() 并对投影窗口调用 close()。
+	 *    卸载阶段 OBS 正在销毁主窗口与各投影窗口, close() 会让 Qt 把事件
+	 *    派发到正在析构/已析构的对象上 —— 虚调用打到被释放对象的 vtable,
+	 *    于是每次退出 OBS 都崩在 obs_module_unload:
+	 *      capcast.dll!obs_module_unload -> qt6core -> qt6core -> <invalid>
+	 *
+	 *    投影窗口由 OBS 自己在退出时销毁; 正常停止(菜单/热键/OBS 退出事件)
+	 *    仍会走 stop_output() 去关投影。 */
+	capcast::stop_audio_only();
 
-	/* 4. 同步销毁设置对话框。
-	 *    注意: 不能用 deleteLater() —— 延迟删除会被推迟到插件卸载之后执行,
-	 *    届时析构函数所在的代码已失效, 会调用无效地址导致 OBS 崩溃。
-	 *    同步 delete 时代码仍然有效, 且会正确从父窗口(OBS 主窗口)的子列表中移除。 */
-	if (g_settings) {
-		delete g_settings;
-		g_settings = nullptr;
-	}
+	/* 4. 设置对话框不在这里 delete。
+	 *    它是 OBS 主窗口的子对象, 由 Qt 的父子所有权自动销毁, 不会泄漏;
+	 *    而我们若在卸载阶段同步 delete, 一旦 OBS 已经先销毁过它, 就是
+	 *    二次析构(悬垂指针 -> 崩溃)。g_settings 用 QPointer 持有, 被销毁
+	 *    后自动置空, 这里清空引用即可。 */
+	g_settings = nullptr;
 
 	blog(LOG_INFO, "[CapCast] plugin unloaded");
 }

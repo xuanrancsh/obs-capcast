@@ -95,6 +95,21 @@ void cfg_set_audio_volume(double percent);
  * 只影响送到采集卡的声音, 不改 OBS 混音器里的任何音量。 */
 void set_output_volume(double percent);
 
+/* 订阅哪一条音轨(1-6, 对应 OBS 混音器里的音轨 1-6, 默认 1)。
+ * 只有勾选了该音轨的源才会出现在这一路混音里。 */
+int cfg_audio_track();
+void cfg_set_audio_track(int track);
+
+/* 运行中切换订阅音轨: 立即生效(先按原 mix 索引取消订阅, 再按新索引订阅)。
+ * 未运行时只记录, 下次开始时生效。 */
+void apply_audio_track(int track);
+
+/* 只停止音频路由, 不触碰任何 Qt 窗口。
+ * 供 obs_module_unload 调用: 卸载阶段 OBS 正在销毁主窗口与投影窗口,
+ * 此时遍历/关闭 QWidget 会把事件派发到已析构的对象上导致崩溃。
+ * 投影窗口交由 OBS 自己销毁。 */
+void stop_audio_only();
+
 QString cfg_source();                       /* "program" | "preview" */
 void cfg_set_source(const QString &s);
 
