@@ -192,17 +192,20 @@ function(_check_dependencies)
         file(ARCHIVE_EXTRACT INPUT "${dependencies_dir}/${file}" DESTINATION "${dependencies_dir}")
         # Patch obs-studio bundled zlib: replace removed MSVC symbol __ms_vsnprintf
         # with standard vsnprintf so it links on modern MSVC (VS2022+).
-        file(GLOB _zlib_src_files
-             "${dependencies_dir}/${_obs_destination}/deps/zlib-src/*.c"
-             "${dependencies_dir}/${_obs_destination}/deps/zlib-src/*.h")
-        foreach(_zf ${_zlib_src_files})
+        # The zlib source lives at <obs-studio>/deps/zlib*/ and is referenced by libobs.
+        file(GLOB_RECURSE _zlib_patch_files
+             "${dependencies_dir}/${destination}/*.c"
+             "${dependencies_dir}/${destination}/*.h")
+        set(_patched 0)
+        foreach(_zf ${_zlib_patch_files})
           file(READ "${_zf}" _zc)
           if(_zc MATCHES "__ms_vsnprintf")
             string(REPLACE "__ms_vsnprintf" "vsnprintf" _zc "${_zc}")
             file(WRITE "${_zf}" "${_zc}")
-            message(STATUS "Patched zlib symbol in ${_zf}")
+            math(EXPR _patched "${_patched}+1")
           endif()
         endforeach()
+        message(STATUS "Patched __ms_vsnprintf in ${_patched} file(s)")
       else()
         file(ARCHIVE_EXTRACT INPUT "${dependencies_dir}/${file}" DESTINATION "${dependencies_dir}/${destination}")
       endif()
