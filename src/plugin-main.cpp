@@ -102,15 +102,9 @@ static void frontend_event(enum obs_frontend_event event, void *)
 
 /* ================= 模块入口 ================= */
 
-/* 注册音频路由过滤器源类型(在 capcast-core.cpp 定义) */
-extern void capcast_router_register();
-
 bool obs_module_load(void)
 {
 	blog(LOG_INFO, "%s %s loaded", PLUGIN_DISPLAY_NAME, PLUGIN_VERSION);
-
-	/* 注册音频路由过滤器(直接软路由到采集卡) */
-	capcast_router_register();
 
 	/* 默认配置(首次运行时写入) */
 	if (capcast::cfg_source().isEmpty())

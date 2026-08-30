@@ -3,6 +3,20 @@
  *
  * 平台: Windows (显示扩展/音频枚举为 Win32 API, 跨平台可降级为仅 Qt 屏幕)
  * 依赖: libobs + obs-frontend-api + Qt6 Widgets
+ *
+ * 音频路由 —— 独立于 OBS 混音器运行:
+ *   通过 obs_add_raw_audio_callback() 订阅 OBS 主混音(mix 0)的"成品音频",
+ *   并让 OBS 按采集卡端点的真实参数(采样率/声道)完成混音与重采样;
+ *   插件只负责 float -> 设备原始格式(8/16/24/32bit/float)的落格式 + 一次写入。
+ *
+ *   相比旧实现(逐源挂 filter、各源各自 memcpy 进 WASAPI):
+ *     - 旧实现把每个源顺序写进设备缓冲 -> 各源被时间轴错开, 听感即"杂音";
+ *       现在订阅的是 OBS 已混好的单路音频, 天然不存在此问题。
+ *     - 旧实现硬编码按 float 喂设备, 与采集卡真实 mix format 错配 -> 白噪;
+ *       现在严格按 GetMixFormat() 的位深/格式转换。
+ *     - 旧实现 buffer 请求 10000000hns(=1秒) -> 延迟严重; 现在 + 自适应积压控制,
+ *       把实际延迟钉在一个音频块的量级。
+ *   全程不改 OBS 混音器/监听设备设置, 也不走 audio_monitor。
  */
 #include "capcast-core.hpp"
 
@@ -10,7 +24,7 @@
 #include <obs-frontend-api.h>
 #include <obs.h>
 #include <util/config-file.h> /* obs 31: 原 util/config.h 已合并到此 */
-#include <media-io/audio-resampler.h>
+#include <media-io/audio-io.h>
 
 #include <QGuiApplication>
 #include <QScreen>
@@ -28,24 +42,15 @@
 #include <propidl.h>
 #include <mutex>
 #include <atomic>
+#include <vector>
 #endif
 
 /* ================= 内部状态 ================= */
 namespace {
 
-/* 已挂上路由过滤器的场景/源, 停止时移除 */
-struct RouterAttachment {
-	obs_source_t *host;
-	obs_source_t *filter;
-};
-
 struct OutputState {
 	bool active = false;
 	QString last_error;
-
-	/* 直接音频路由: WASAPI 输出 + 挂在各音频源上的过滤器 */
-	QVector<RouterAttachment> router_attachments;
-	int audio_chunks = 0; /* 诊断: 流经路由的音频块计数 */
 };
 
 OutputState g_state;
@@ -63,7 +68,6 @@ config_t *user_config()
 	return obs_frontend_get_user_config();
 }
 
-/* UTF-8 宽字符辅助 (Windows) */
 #ifdef _WIN32
 QString wide_to_qstring(const wchar_t *w)
 {
@@ -73,16 +77,14 @@ QString wide_to_qstring(const wchar_t *w)
 
 } // namespace
 
-/* ================= 直接音频路由(WASAPI 直出, 绕开 OBS 混音器) =================
- * 思路(参考 exeldro/obs-audio-monitor):
- *   - 注册一个隐藏音频过滤器 capcast_audio_router
- *   - 开始推流时: 初始化 WASAPI 输出到采集卡设备, 并把过滤器挂到所有场景上
- *   - 场景的混合音频 → filter_audio 回调 → 重采样 → WASAPI 直出到采集卡
- *   - 完全不改动 OBS 混音器/监控设备设置
+/* ================= WASAPI 直出(独立于 OBS 混音器) =================
+ * 数据通路:
+ *   OBS 主混音(mix 0) --obs_add_raw_audio_callback--> on_master_audio()
+ *     --> wasapi_write_audio() -> float 转设备格式 -> 一次 memcpy 进设备缓冲
  */
 #ifdef _WIN32
 
-/* WASAPI 渲染端点(shared mode, 跟随设备混音格式) */
+/* WASAPI 渲染端点(shared mode, 严格使用设备混音格式) */
 struct WasapiOutput {
 	IMMDevice *device = nullptr;
 	IAudioClient *client = nullptr;
@@ -90,18 +92,21 @@ struct WasapiOutput {
 	UINT32 buffer_frames = 0;
 	UINT32 channels = 2;
 	UINT32 sample_rate = 48000;
-	std::atomic<bool> active{false};
+	UINT32 dev_bits = 32;  /* 设备每采样位深: 8/16/24/32 */
+	bool dev_float = true; /* 设备是否为 32bit IEEE float */
+	UINT32 frame_bytes = 8; /* 一帧(全部声道)的字节数 */
 
-	/* 保护下面的 COM 对象与重采样器:
-	 * filter_audio 在 OBS 音频线程执行, 而 start/stop/start 在 UI 线程,
+	UINT32 obs_block = 0; /* OBS 每次音频回调给的帧数, 首次回调时学到 */
+
+	/* 保护下面的 COM 对象与暂存缓冲:
+	 * on_master_audio 在 OBS 音频线程执行, 而 start/stop 在 UI 线程,
 	 * 需要互斥。用 recursive_mutex: wasapi_start 失败路径会内调
 	 * wasapi_shutdown, 递归加锁避免自死锁。 */
 	std::recursive_mutex mtx;
+	std::atomic<bool> active{false};
 
-	/* 重采样: OBS float-planar 48k → 设备 float-interleaved */
-	audio_resampler_t *resampler = nullptr;
-	uint8_t *resample_buf[MAX_AV_PLANES] = {};
-	uint32_t resample_frames = 0;
+	/* float -> 设备格式 的暂存缓冲 */
+	std::vector<uint8_t> scratch;
 };
 
 static WasapiOutput g_wasapi;
@@ -109,10 +114,6 @@ static WasapiOutput g_wasapi;
 static void wasapi_shutdown()
 {
 	std::lock_guard<std::recursive_mutex> lk(g_wasapi.mtx);
-	if (g_wasapi.resampler) {
-		audio_resampler_destroy(g_wasapi.resampler);
-		g_wasapi.resampler = nullptr;
-	}
 	if (g_wasapi.render)
 		g_wasapi.render->Release();
 	g_wasapi.render = nullptr;
@@ -122,15 +123,55 @@ static void wasapi_shutdown()
 	if (g_wasapi.device)
 		g_wasapi.device->Release();
 	g_wasapi.device = nullptr;
+	g_wasapi.buffer_frames = 0;
+	g_wasapi.obs_block = 0;
+	g_wasapi.scratch.clear();
 	g_wasapi.active = false;
+}
+
+/* KSDATAFORMAT_SUBTYPE_IEEE_FLOAT = {00000003-0000-0010-8000-00AA00389B71}
+ * 本地定义, 避免依赖 ksmedia.h / uuid.lib 符号 */
+static const GUID k_subtype_ieee_float = {
+	0x00000003, 0x0000, 0x0010,
+	{0x80, 0x00, 0x00, 0xAA, 0x00, 0x38, 0x9B, 0x71}};
+
+/* 判断设备混音格式是否为 32bit IEEE float */
+static bool wave_is_float(const WAVEFORMATEX *wf)
+{
+	if (wf->wFormatTag == WAVE_FORMAT_IEEE_FLOAT)
+		return true;
+	if (wf->wFormatTag == WAVE_FORMAT_EXTENSIBLE && wf->cbSize >= 22) {
+		const WAVEFORMATEXTENSIBLE *wfe =
+			reinterpret_cast<const WAVEFORMATEXTENSIBLE *>(wf);
+		return IsEqualGUID(wfe->SubFormat, k_subtype_ieee_float) != FALSE;
+	}
+	return false;
+}
+
+/* 设备声道数 -> OBS speaker 布局 */
+static enum speaker_layout layout_from_channels(UINT32 n)
+{
+	switch (n) {
+	case 1:
+		return SPEAKERS_MONO;
+	case 3:
+		return SPEAKERS_2POINT1;
+	case 4:
+		return SPEAKERS_4POINT0;
+	case 6:
+		return SPEAKERS_5POINT1;
+	case 8:
+		return SPEAKERS_7POINT1;
+	default:
+		return SPEAKERS_STEREO;
+	}
 }
 
 static bool wasapi_start(const char *device_id)
 {
 	std::lock_guard<std::recursive_mutex> lk(g_wasapi.mtx);
 	HRESULT hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
-	const bool need_uninit = SUCCEEDED(hr) || hr == S_FALSE;
-	(void)need_uninit;
+	(void)hr;
 
 	IMMDeviceEnumerator *enumerator = nullptr;
 	/* CLSID_MMDeviceEnumerator 本地定义, 避免 uuid.lib 符号问题 */
@@ -168,21 +209,48 @@ static bool wasapi_start(const char *device_id)
 		return false;
 	}
 
+	/* shared mode 必须使用 GetMixFormat() 返回的确切格式 */
 	WAVEFORMATEX *wfex = nullptr;
 	hr = g_wasapi.client->GetMixFormat(&wfex);
 	if (FAILED(hr) || !wfex) {
+		CAPCAST_LOG(LOG_ERROR, "wasapi: GetMixFormat failed");
 		wasapi_shutdown();
 		return false;
 	}
 	g_wasapi.sample_rate = wfex->nSamplesPerSec;
 	g_wasapi.channels = wfex->nChannels;
+	g_wasapi.dev_float = wave_is_float(wfex);
+	if (g_wasapi.dev_float) {
+		g_wasapi.dev_bits = 32;
+	} else {
+		switch (wfex->wBitsPerSample) {
+		case 8:
+			g_wasapi.dev_bits = 8;
+			break;
+		case 24:
+			g_wasapi.dev_bits = 24;
+			break;
+		case 32:
+			g_wasapi.dev_bits = 32;
+			break;
+		default:
+			g_wasapi.dev_bits = 16;
+			break;
+		}
+	}
+	g_wasapi.frame_bytes =
+		g_wasapi.channels * (g_wasapi.dev_bits / 8);
 
+	/* 缓冲申请 100ms: 仅作为抖动余量(headroom)。
+	 * 实际延迟由"积压量(padding)"决定, 由下面的自适应控制压在低位,
+	 * 而不是像旧实现那样把缓冲本身开成 1 秒导致延迟爆炸。 */
 	hr = g_wasapi.client->Initialize(
-		AUDCLNT_SHAREMODE_SHARED, 0, 10000000 /* 100ms */, 0, wfex,
+		AUDCLNT_SHAREMODE_SHARED, 0, 1000000 /* 100ms */, 0, wfex,
 		nullptr);
 	CoTaskMemFree(wfex);
 	if (FAILED(hr)) {
-		CAPCAST_LOG(LOG_ERROR, "wasapi: initialize failed (0x%08lX)", hr);
+		CAPCAST_LOG(LOG_ERROR, "wasapi: initialize failed (0x%08lX)",
+			    hr);
 		wasapi_shutdown();
 		return false;
 	}
@@ -198,205 +266,221 @@ static bool wasapi_start(const char *device_id)
 		return false;
 	}
 
-	/* 重采样器: OBS 输出(float planar, 48k, 实际布局) → 设备(float interleaved) */
-	const struct audio_output_info *info =
-		audio_output_get_info(obs_get_audio());
-	/* 设备声道数 → obs speaker 布局 */
-	const auto layout_from_channels = [](UINT32 n) {
-		switch (n) {
-		case 1:
-			return SPEAKERS_MONO;
-		case 3:
-			return SPEAKERS_2POINT1;
-		case 4:
-			return SPEAKERS_4POINT0;
-		case 6:
-			return SPEAKERS_5POINT1;
-		case 8:
-			return SPEAKERS_7POINT1;
-		default:
-			return SPEAKERS_STEREO;
-		}
-	};
-	struct resample_info from{};
-	struct resample_info to{};
-	from.samples_per_sec = info ? info->samples_per_sec : 48000;
-	from.speakers = info ? info->speakers : SPEAKERS_STEREO;
-	from.format = AUDIO_FORMAT_FLOAT_PLANAR;
-	to.samples_per_sec = g_wasapi.sample_rate;
-	to.speakers = layout_from_channels(g_wasapi.channels);
-	to.format = AUDIO_FORMAT_FLOAT;
-	g_wasapi.resampler = audio_resampler_create(&to, &from);
-	if (!g_wasapi.resampler) {
-		CAPCAST_LOG(LOG_ERROR, "wasapi: resampler create failed");
-		wasapi_shutdown();
-		return false;
-	}
-
 	hr = g_wasapi.client->Start();
 	if (FAILED(hr)) {
 		wasapi_shutdown();
 		return false;
 	}
 	g_wasapi.active = true;
-	CAPCAST_LOG(LOG_INFO, "wasapi output started (%uHz %uch)",
-		    g_wasapi.sample_rate, g_wasapi.channels);
+	CAPCAST_LOG(LOG_INFO,
+		    "wasapi started: %uHz %uch %ubit%s, buffer %u frames",
+		    g_wasapi.sample_rate, g_wasapi.channels,
+		    g_wasapi.dev_bits, g_wasapi.dev_float ? " float" : " int",
+		    g_wasapi.buffer_frames);
 	return true;
 }
 
-/* 把 resample 后的 planar 缓冲转成设备期望的 interleaved float 并写入 */
-static void wasapi_write_audio(const uint8_t *const data[MAX_AV_PLANES],
-			       uint32_t frames)
+/* 交错 float32 -> 设备原始格式 */
+static void convert_float_to_device(const float *src, uint8_t *dst,
+				    uint32_t frames)
 {
-	std::lock_guard<std::recursive_mutex> lk(g_wasapi.mtx);
-	if (!g_wasapi.active || !g_wasapi.render || frames == 0)
-		return;
+	const UINT32 total = frames * g_wasapi.channels;
 
-	/* 重采样到设备格式 */
-	uint32_t out_frames = 0;
-	uint64_t ts_offset = 0;
-	if (!audio_resampler_resample(g_wasapi.resampler,
-				      g_wasapi.resample_buf, &out_frames,
-				      &ts_offset, data, frames)) {
+	if (g_wasapi.dev_float) {
+		memcpy(dst, src, (size_t)total * sizeof(float));
 		return;
 	}
-	if (out_frames == 0)
-		return;
-	g_wasapi.resample_frames = out_frames;
 
-	/* 逐块写入设备环形缓冲 */
-	float *out = (float *)g_wasapi.resample_buf[0];
-	uint32_t remaining = out_frames;
+	switch (g_wasapi.dev_bits) {
+	case 8: { /* unsigned 8bit */
+		for (UINT32 i = 0; i < total; ++i) {
+			float v = src[i];
+			v = v < -1.f ? -1.f : (v > 1.f ? 1.f : v);
+			dst[i] = (uint8_t)(int)((v + 1.f) * 127.5f);
+		}
+		break;
+	}
+	case 16: {
+		int16_t *p = reinterpret_cast<int16_t *>(dst);
+		for (UINT32 i = 0; i < total; ++i) {
+			float v = src[i];
+			v = v < -1.f ? -1.f : (v > 1.f ? 1.f : v);
+			p[i] = (int16_t)(v * 32767.f);
+		}
+		break;
+	}
+	case 24: {
+		for (UINT32 i = 0; i < total; ++i) {
+			float v = src[i];
+			v = v < -1.f ? -1.f : (v > 1.f ? 1.f : v);
+			const int32_t s = (int32_t)(v * 8388607.f);
+			uint8_t *p = dst + (size_t)i * 3;
+			p[0] = (uint8_t)(s & 0xFF);
+			p[1] = (uint8_t)((s >> 8) & 0xFF);
+			p[2] = (uint8_t)((s >> 16) & 0xFF);
+		}
+		break;
+	}
+	default: { /* 32bit int */
+		int32_t *p = reinterpret_cast<int32_t *>(dst);
+		for (UINT32 i = 0; i < total; ++i) {
+			float v = src[i];
+			v = v < -1.f ? -1.f : (v > 1.f ? 1.f : v);
+			p[i] = (int32_t)(v * 2147483647.f);
+		}
+		break;
+	}
+	}
+}
+
+/* 把 OBS 主混音(交错 float32, 已是设备采样率/声道)写入采集卡端点 */
+static void wasapi_write_audio(const float *src, uint32_t frames)
+{
+	std::lock_guard<std::recursive_mutex> lk(g_wasapi.mtx);
+	if (!g_wasapi.active || !g_wasapi.render || !src || frames == 0)
+		return;
+
+	/* 1) float -> 设备原始格式 */
+	const size_t need =
+		(size_t)frames * g_wasapi.channels * (g_wasapi.dev_bits / 8);
+	if (g_wasapi.scratch.size() < need)
+		g_wasapi.scratch.resize(need);
+	convert_float_to_device(src, g_wasapi.scratch.data(), frames);
+	const uint8_t *data = g_wasapi.scratch.data();
+
+	/* 2) 目标积压 = 一个 OBS 音频块。让实际延迟贴着"一块"的量级,
+	 *    而不是整套缓冲, 也不会像旧实现那样越跑越慢。 */
+	if (g_wasapi.obs_block == 0)
+		g_wasapi.obs_block = frames;
+	const UINT32 target = g_wasapi.obs_block < g_wasapi.buffer_frames
+				      ? g_wasapi.obs_block
+				      : g_wasapi.buffer_frames / 2;
+
+	UINT32 pad = 0;
+	if (FAILED(g_wasapi.client->GetCurrentPadding(&pad)))
+		return;
+
+	/* 3) 自适应: 设备时钟略慢于 OBS 时积压会缓慢上涨,
+	 *    每次最多丢 1ms, 听感无感, 但能长期把延迟钉在低位。 */
+	if (pad > target) {
+		UINT32 excess = pad - target;
+		const UINT32 max_adj = g_wasapi.sample_rate / 1000; /* 1ms */
+		if (excess > max_adj)
+			excess = max_adj;
+		if (excess >= frames)
+			return;
+		data += (size_t)excess * g_wasapi.frame_bytes;
+		frames -= excess;
+	}
+
+	/* 4) 写入设备环形缓冲(不阻塞 OBS 音频线程) */
+	UINT32 remaining = frames;
 	while (remaining > 0) {
-		UINT32 pad = 0;
 		if (FAILED(g_wasapi.client->GetCurrentPadding(&pad)))
 			return;
-		UINT32 avail = g_wasapi.buffer_frames - pad;
-		if (avail == 0) {
-			/* 环形缓冲满: 丢弃剩余(不能阻塞音频线程) */
-			break;
-		}
-		UINT32 chunk = remaining < avail ? remaining : avail;
-		float *dst = nullptr;
-		HRESULT hr = g_wasapi.render->GetBuffer(chunk, (BYTE **)&dst);
-		if (FAILED(hr)) {
-			if (hr == AUDCLNT_E_BUFFER_TOO_LARGE ||
-			    hr == AUDCLNT_E_BUFFER_ERROR) {
-				g_wasapi.render->ReleaseBuffer(chunk, 0);
-				continue;
-			}
+		const UINT32 avail = g_wasapi.buffer_frames - pad;
+		if (avail == 0)
+			break; /* 缓冲满: 丢弃剩余 */
+		const UINT32 chunk = remaining < avail ? remaining : avail;
+
+		BYTE *dst = nullptr;
+		/* 取缓冲失败: 放弃本帧剩余部分。不能阻塞 OBS 音频线程,
+		 * 也不能对未成功 GetBuffer 的句柄调用 ReleaseBuffer。 */
+		if (FAILED(g_wasapi.render->GetBuffer(chunk, &dst)))
 			return;
-		}
-		memcpy(dst, out, chunk * g_wasapi.channels * sizeof(float));
-		out += chunk * g_wasapi.channels;
+		memcpy(dst, data, (size_t)chunk * g_wasapi.frame_bytes);
+		data += (size_t)chunk * g_wasapi.frame_bytes;
 		remaining -= chunk;
 		g_wasapi.render->ReleaseBuffer(chunk, 0);
 	}
 }
 
+/* OBS 主混音回调(在 OBS 音频线程执行) */
+static void on_master_audio(void *param, size_t mix_idx,
+			    struct audio_data *audio)
+{
+	(void)param;
+	(void)mix_idx;
+	if (!audio || audio->frames == 0 || !audio->data[0])
+		return;
+	/* conversion 已让 OBS 输出"设备采样率 + 设备声道 + 交错 float32" */
+	wasapi_write_audio(reinterpret_cast<const float *>(audio->data[0]),
+			   audio->frames);
+}
+
 #endif /* _WIN32 */
 
-/* 音频路由过滤器源类型: 挂到场景上, 把场景混合音频转发给 WASAPI 直出 */
-static const char *router_get_name(void *)
-{
-	return "CapCast Audio Router";
-}
+/* ================= 音频路由启停 ================= */
 
-static void *router_create(obs_data_t *, obs_source_t *)
-{
-	return bzalloc(sizeof(uint8_t));
-}
-
-static void router_destroy(void *data)
-{
-	bfree(data);
-}
-
-static struct obs_audio_data *router_filter_audio(void *, struct obs_audio_data *audio)
-{
+/* 清理旧版本残留在场景/源上的 capcast-router 过滤器
+ * (旧实现逐源挂 filter 做直出; 新实现改为订阅主混音, 不再需要过滤器)。
+ * 注意: 绝不能在 obs_enum_sources 的回调里操作源 —— 枚举期间 OBS 持有
+ * 源列表锁。因此先"收集"源列表, 枚举结束后再"处理"。 */
 #ifdef _WIN32
-	if (g_wasapi.active && audio && audio->frames > 0) {
-		wasapi_write_audio((const uint8_t *const *)audio->data,
-				   audio->frames);
-	}
-#endif
-	return audio; /* 不改动原音频, 正常继续走 OBS 混音 */
-}
-
-/* obs_source_info 用零初始化+逐字段赋值(C++17 不支持指定初始化器) */
-static struct obs_source_info capcast_audio_router = {};
-void capcast_router_register()
+static void purge_legacy_router_filters()
 {
-	capcast_audio_router.id = "capcast_audio_router";
-	capcast_audio_router.type = OBS_SOURCE_TYPE_FILTER;
-	/* 与 exeldro/obs-audio-monitor 一致: 过滤器只声明 OBS_SOURCE_AUDIO,
-	 * 不额外加 DO_NOT_DUPLICATE(加了可能影响 OBS 调用 filter_audio) */
-	capcast_audio_router.output_flags = OBS_SOURCE_AUDIO;
-	capcast_audio_router.get_name = router_get_name;
-	capcast_audio_router.create = router_create;
-	capcast_audio_router.destroy = router_destroy;
-	capcast_audio_router.filter_audio = router_filter_audio;
-	obs_register_source(&capcast_audio_router);
-}
+	QVector<obs_source_t *> hosts;
+	obs_enum_sources(
+		[](void *param, obs_source_t *source) {
+			auto *list =
+				static_cast<QVector<obs_source_t *> *>(param);
+			obs_source_t *f = obs_source_get_filter_by_name(
+				source, "capcast-router");
+			if (f) {
+				obs_source_release(f);
+				list->append(source);
+			}
+			return true;
+		},
+		&hosts);
 
-/* 开始直接音频路由: 初始化 WASAPI + 给所有音频源挂过滤器
- * 注意: 绝不能在 obs_enum_sources 的回调里创建/添加源 —— 枚举期间 OBS 持有
- * 源列表锁, 回调内建源会死锁或失败, 导致过滤器根本挂不上(表现为没声音)。
- * 因此先"收集"源列表, 枚举结束后再"挂接"。 */
+	for (obs_source_t *host : hosts) {
+		obs_source_t *f =
+			obs_source_get_filter_by_name(host, "capcast-router");
+		if (!f)
+			continue;
+		obs_source_filter_remove(host, f);
+		obs_source_release(f);
+	}
+	if (!hosts.isEmpty())
+		CAPCAST_LOG(LOG_INFO, "purged %d legacy router filter(s)",
+			    (int)hosts.size());
+}
+#endif
+
+/* 开始音频路由: 订阅 OBS 主混音 -> 直出采集卡端点
+ * 完全不改动 OBS 混音器音量/静音/监听设备设置, 也不使用 audio_monitor。 */
 static QString start_audio_routing(const QString &device_id)
 {
 #ifdef _WIN32
 	const QString dev_id = device_id.isEmpty() ? QStringLiteral("default")
 						   : device_id;
+
+	purge_legacy_router_filters();
+
 	if (!wasapi_start(qUtf8Printable(dev_id)))
 		return QStringLiteral("音频设备打开失败(%1)").arg(dev_id);
 
-	/* 1. 收集所有"真正产生音频"的源(非场景/非过滤器/非转场)
-	 *    场景会混入其子源的音频, 若也给场景挂过滤器会导致同一份音频被路由两次 */
-	QVector<obs_source_t *> hosts;
-	obs_enum_sources(
-		[](void *param, obs_source_t *source) {
-			auto *list = static_cast<QVector<obs_source_t *> *>(param);
-			const uint32_t flags = obs_source_get_output_flags(source);
-			if ((flags & OBS_SOURCE_AUDIO) == 0)
-				return true;
-			const enum obs_source_type type =
-				obs_source_get_type(source);
-			if (type == OBS_SOURCE_TYPE_SCENE ||
-			    type == OBS_SOURCE_TYPE_FILTER ||
-			    type == OBS_SOURCE_TYPE_TRANSITION)
-				return true;
-			list->append(source);
-			return true;
-		},
-		&hosts);
-
-	/* 2. 枚举结束后再创建并挂接过滤器(此时源列表锁已释放) */
-	for (obs_source_t *host : hosts) {
-		obs_source_t *filter = obs_source_create_private(
-			"capcast_audio_router", "capcast-router", nullptr);
-		if (!filter) {
-			CAPCAST_LOG(LOG_WARNING, "router filter create failed");
-			continue;
-		}
-		obs_source_filter_add(host, filter);
-		RouterAttachment att;
-		att.host = host;
-		att.filter = filter;
-		g_state.router_attachments.append(att);
-		CAPCAST_LOG(LOG_INFO, "router attached to source: %s",
-			    obs_source_get_name(host));
+	if (!obs_get_audio()) {
+		wasapi_shutdown();
+		return QStringLiteral("OBS 音频未初始化");
 	}
 
-	if (g_state.router_attachments.isEmpty()) {
-		CAPCAST_LOG(LOG_WARNING,
-			    "no audio source found for routing (共枚举 %d 个源)",
-			    (int)hosts.size());
-	}
+	/* 让 OBS 直接用采集卡端点的采样率/声道把主混音转换成交错 float32,
+	 * 插件只做最后一次"float -> 设备原始格式"的落格式。
+	 * 这样混音、重采样、声道映射全部由 OBS 音频引擎负责。 */
+	struct audio_convert_info conv{};
+	conv.samples_per_sec = g_wasapi.sample_rate;
+	conv.format = AUDIO_FORMAT_FLOAT;
+	conv.speakers = layout_from_channels(g_wasapi.channels);
+	conv.allow_clipping = true;
+	obs_add_raw_audio_callback(0, &conv, on_master_audio, nullptr);
 
-	CAPCAST_LOG(LOG_INFO, "audio direct-routed to %s (%d sources)",
-		    qUtf8Printable(dev_id),
-		    (int)g_state.router_attachments.size());
+	CAPCAST_LOG(LOG_INFO,
+		    "audio routing started: master mix -> %s (%uHz %uch %ubit%s)",
+		    qUtf8Printable(dev_id), g_wasapi.sample_rate,
+		    g_wasapi.channels, g_wasapi.dev_bits,
+		    g_wasapi.dev_float ? " float" : " int");
 	return {};
 #else
 	Q_UNUSED(device_id);
@@ -406,18 +490,10 @@ static QString start_audio_routing(const QString &device_id)
 
 static void stop_audio_routing()
 {
-	/* 移除并销毁场景上的过滤器 */
-	for (const auto &att : g_state.router_attachments) {
-		if (att.host && att.filter) {
-			obs_source_filter_remove(att.host, att.filter);
-			obs_source_release(att.filter);
-		}
-	}
-	g_state.router_attachments.clear();
-
 #ifdef _WIN32
+	obs_remove_raw_audio_callback(0, on_master_audio, nullptr);
 	wasapi_shutdown();
-	CAPCAST_LOG(LOG_INFO, "audio direct-routing stopped");
+	CAPCAST_LOG(LOG_INFO, "audio routing stopped");
 #endif
 }
 
@@ -648,7 +724,7 @@ QString start_output(int screen_index, const QString &audio_device_id,
 	CAPCAST_LOG(LOG_INFO, "projector opened on screen %d (%s)", screen_index,
 		    qUtf8Printable(screens.at(screen_index).name));
 
-	/* 3. 直接软路由全部音频到采集卡(WASAPI 直出, 不动 OBS 混音器) */
+	/* 3. 音频路由到采集卡(订阅 OBS 主混音, 独立于 OBS 混音器设置) */
 	const QString err = start_audio_routing(audio_device_id);
 	if (!err.isEmpty()) {
 		g_state.last_error =
