@@ -34,6 +34,11 @@ if(ENABLE_QT)
                AUTORCC ON)
 endif()
 
+# Windows: WASAPI COM (CLSID_MMDeviceEnumerator 在 uuid.lib, CoInitializeEx 在 ole32.lib)
+if(WIN32)
+  target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE uuid.lib ole32.lib)
+endif()
+
 target_sources(
   ${CMAKE_PROJECT_NAME}
   PRIVATE
