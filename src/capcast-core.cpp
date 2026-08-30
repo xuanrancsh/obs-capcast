@@ -9,7 +9,6 @@
 #include <obs-module.h>
 #include <obs-frontend-api.h>
 #include <obs.h>
-#include <media-io/audio-monitor.h>
 #include <util/config.h>
 
 #include <QGuiApplication>
@@ -29,10 +28,20 @@
 /* ================= 内部状态 ================= */
 namespace {
 
+/* 单个音频源的监控类型快照(用于停止时恢复) */
+struct SourceMonitorSnapshot {
+	obs_source_t *source;
+	enum obs_monitoring_type type;
+};
+
 struct OutputState {
 	bool active = false;
-	audio_monitor_t *monitor = nullptr; /* 采集卡音频路由 */
 	QString last_error;
+
+	/* 音频路由状态: 全局监控设备 + 各源监控类型(均用于停止时恢复) */
+	QString prev_monitor_name;
+	QString prev_monitor_id;
+	QVector<SourceMonitorSnapshot> source_snapshots;
 };
 
 OutputState g_state;
@@ -202,17 +211,25 @@ CapCastAudioDevice find_audio_device_by_pattern(const QString &pattern)
 
 /* ================= 一键推流 ================= */
 
-static void add_source_to_monitor(void *param, obs_source_t *source)
+/* 把全部音频源设为"监听并输出", 使音频同时进 OBS 混音和全局监控设备(采集卡) */
+static void set_monitor_all_sources(void *param, obs_source_t *source)
 {
-	auto *monitor = static_cast<audio_monitor_t *>(param);
+	auto *snapshots = static_cast<QVector<SourceMonitorSnapshot> *>(param);
 	const uint32_t flags = obs_source_get_output_flags(source);
 	/* 只路由有音频输出的源; 跳过辅助/占位源 */
 	if ((flags & OBS_SOURCE_AUDIO) == 0)
 		return;
 	if (obs_source_get_type(source) == OBS_SOURCE_TYPE_SERVICE)
 		return;
-	audio_monitor_add_source(monitor, source);
-	CAPCAST_LOG(LOG_DEBUG, "audio_monitor_add_source: %s",
+
+	SourceMonitorSnapshot snap;
+	snap.source = source;
+	snap.type = obs_source_get_monitoring_type(source);
+	snapshots->append(snap);
+
+	obs_source_set_monitoring_type(source,
+				       OBS_MONITORING_TYPE_MONITOR_AND_OUTPUT);
+	CAPCAST_LOG(LOG_DEBUG, "monitor source: %s",
 		    obs_source_get_name(source));
 }
 
@@ -234,33 +251,47 @@ QString start_output(int screen_index, const QString &audio_device_id,
 	}
 
 	/* 2. 打开全屏投影(节目/预览)到采集卡副屏 */
-	const enum obs_frontend_source_type type =
-		(source == CapCastProjectorSource::Preview)
-			? OBS_FRONTEND_SOURCE_PREVIEW
-			: OBS_FRONTEND_SOURCE_PROGRAM;
-	obs_frontend_open_projector(type, screen_index, nullptr, nullptr,
-				   nullptr);
+	/* obs 31: type 为字符串, "StudioProgram"=节目, nullptr=默认预览 */
+	const char *projector_type =
+		(source == CapCastProjectorSource::Program)
+			? "StudioProgram"
+			: nullptr;
+	obs_frontend_open_projector(projector_type, screen_index, nullptr,
+				    nullptr);
 	CAPCAST_LOG(LOG_INFO, "projector opened on screen %d (%s)", screen_index,
 		    qUtf8Printable(screens.at(screen_index).name));
 
-	/* 3. 全部音频路由到采集卡端点 */
+	/* 3. 全部音频路由到采集卡: 把全局监控设备设为采集卡 + 全部源开监控 */
+	/*    3.1 记录并保存当前监控设备, 停止时恢复 */
+	const char *cur_name = nullptr;
+	const char *cur_id = nullptr;
+	obs_get_audio_monitoring_device(&cur_name, &cur_id);
+	g_state.prev_monitor_name = cur_name ? QString::fromUtf8(cur_name) : QString();
+	g_state.prev_monitor_id = cur_id ? QString::fromUtf8(cur_id) : QString();
+
 	const QString device = audio_device_id.isEmpty()
 				       ? QStringLiteral("default")
 				       : audio_device_id;
-	audio_monitor_t *monitor = audio_monitor_create(qUtf8Printable(device));
-	if (!monitor) {
-		/* 音频路由失败不阻断投影 */
-		CAPCAST_LOG(LOG_WARNING, "audio_monitor_create(%s) failed",
+	const QString dev_name =
+		audio_device_id.isEmpty() ? QStringLiteral("采集卡") : QString();
+	/*    3.2 设置全局监控设备为采集卡音频端点 */
+	const bool ok = obs_set_audio_monitoring_device(
+		qUtf8Printable(dev_name), qUtf8Printable(device));
+	if (!ok) {
+		CAPCAST_LOG(LOG_WARNING, "obs_set_audio_monitoring_device(%s) failed",
 			    qUtf8Printable(device));
 		g_state.last_error = QStringLiteral(
 			"投影已打开, 但音频路由失败(设备 %1)").arg(device);
 	} else {
-		obs_enum_sources(add_source_to_monitor, monitor);
-		CAPCAST_LOG(LOG_INFO, "audio routed to %s",
-			    qUtf8Printable(device));
+		/*    3.3 全部音频源开启监控(记录原类型以便恢复) */
+		g_state.source_snapshots.clear();
+		obs_enum_sources(set_monitor_all_sources,
+				 &g_state.source_snapshots);
+		CAPCAST_LOG(LOG_INFO, "audio routed to %s (%d sources)",
+			    qUtf8Printable(device),
+			    (int)g_state.source_snapshots.size());
 	}
 
-	g_state.monitor = monitor;
 	g_state.active = true;
 	return {};
 }
@@ -269,11 +300,25 @@ void stop_output()
 {
 	close_projector_windows();
 
-	if (g_state.monitor) {
-		audio_monitor_destroy(g_state.monitor);
-		g_state.monitor = nullptr;
-		CAPCAST_LOG(LOG_INFO, "audio monitor destroyed");
+	/* 恢复各音频源原监控类型 */
+	for (const auto &snap : g_state.source_snapshots) {
+		obs_source_set_monitoring_type(snap.source, snap.type);
 	}
+	g_state.source_snapshots.clear();
+
+	/* 恢复原全局监控设备 */
+	if (!g_state.prev_monitor_id.isEmpty() ||
+	    !g_state.prev_monitor_name.isEmpty()) {
+		obs_set_audio_monitoring_device(
+			qUtf8Printable(g_state.prev_monitor_name),
+			qUtf8Printable(g_state.prev_monitor_id));
+		CAPCAST_LOG(LOG_INFO, "audio monitoring device restored");
+	} else {
+		obs_reset_audio_monitoring();
+	}
+	g_state.prev_monitor_name.clear();
+	g_state.prev_monitor_id.clear();
+
 	g_state.active = false;
 }
 
