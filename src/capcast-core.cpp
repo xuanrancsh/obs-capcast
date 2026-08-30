@@ -27,6 +27,7 @@
 #include <propvarutil.h>
 #include <propidl.h>
 #include <mutex>
+#include <atomic>
 #endif
 
 /* ================= 内部状态 ================= */
@@ -42,8 +43,9 @@ struct OutputState {
 	bool active = false;
 	QString last_error;
 
-	/* 直接音频路由: WASAPI 输出 + 挂在各场景上的过滤器 */
+	/* 直接音频路由: WASAPI 输出 + 挂在各音频源上的过滤器 */
 	QVector<RouterAttachment> router_attachments;
+	int audio_chunks = 0; /* 诊断: 流经路由的音频块计数 */
 };
 
 OutputState g_state;
@@ -88,7 +90,13 @@ struct WasapiOutput {
 	UINT32 buffer_frames = 0;
 	UINT32 channels = 2;
 	UINT32 sample_rate = 48000;
-	bool active = false;
+	std::atomic<bool> active{false};
+
+	/* 保护下面的 COM 对象与重采样器:
+	 * filter_audio 在 OBS 音频线程执行, 而 start/stop/start 在 UI 线程,
+	 * 需要互斥。用 recursive_mutex: wasapi_start 失败路径会内调
+	 * wasapi_shutdown, 递归加锁避免自死锁。 */
+	std::recursive_mutex mtx;
 
 	/* 重采样: OBS float-planar 48k → 设备 float-interleaved */
 	audio_resampler_t *resampler = nullptr;
@@ -100,6 +108,7 @@ static WasapiOutput g_wasapi;
 
 static void wasapi_shutdown()
 {
+	std::lock_guard<std::recursive_mutex> lk(g_wasapi.mtx);
 	if (g_wasapi.resampler) {
 		audio_resampler_destroy(g_wasapi.resampler);
 		g_wasapi.resampler = nullptr;
@@ -118,6 +127,7 @@ static void wasapi_shutdown()
 
 static bool wasapi_start(const char *device_id)
 {
+	std::lock_guard<std::recursive_mutex> lk(g_wasapi.mtx);
 	HRESULT hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
 	const bool need_uninit = SUCCEEDED(hr) || hr == S_FALSE;
 	(void)need_uninit;
@@ -238,6 +248,7 @@ static bool wasapi_start(const char *device_id)
 static void wasapi_write_audio(const uint8_t *const data[MAX_AV_PLANES],
 			       uint32_t frames)
 {
+	std::lock_guard<std::recursive_mutex> lk(g_wasapi.mtx);
 	if (!g_wasapi.active || !g_wasapi.render || frames == 0)
 		return;
 
@@ -318,8 +329,9 @@ void capcast_router_register()
 {
 	capcast_audio_router.id = "capcast_audio_router";
 	capcast_audio_router.type = OBS_SOURCE_TYPE_FILTER;
-	capcast_audio_router.output_flags =
-		OBS_SOURCE_AUDIO | OBS_SOURCE_DO_NOT_DUPLICATE;
+	/* 与 exeldro/obs-audio-monitor 一致: 过滤器只声明 OBS_SOURCE_AUDIO,
+	 * 不额外加 DO_NOT_DUPLICATE(加了可能影响 OBS 调用 filter_audio) */
+	capcast_audio_router.output_flags = OBS_SOURCE_AUDIO;
 	capcast_audio_router.get_name = router_get_name;
 	capcast_audio_router.create = router_create;
 	capcast_audio_router.destroy = router_destroy;
@@ -327,7 +339,10 @@ void capcast_router_register()
 	obs_register_source(&capcast_audio_router);
 }
 
-/* 开始直接音频路由: 初始化 WASAPI + 给所有场景挂过滤器 */
+/* 开始直接音频路由: 初始化 WASAPI + 给所有音频源挂过滤器
+ * 注意: 绝不能在 obs_enum_sources 的回调里创建/添加源 —— 枚举期间 OBS 持有
+ * 源列表锁, 回调内建源会死锁或失败, 导致过滤器根本挂不上(表现为没声音)。
+ * 因此先"收集"源列表, 枚举结束后再"挂接"。 */
 static QString start_audio_routing(const QString &device_id)
 {
 #ifdef _WIN32
@@ -336,41 +351,50 @@ static QString start_audio_routing(const QString &device_id)
 	if (!wasapi_start(qUtf8Printable(dev_id)))
 		return QStringLiteral("音频设备打开失败(%1)").arg(dev_id);
 
-	/* 把过滤器挂到所有场景上 */
-	struct RouterCallbackData {
-		QVector<RouterAttachment> *list;
-		obs_source_t *router;
-	} cb;
-	cb.list = &g_state.router_attachments;
-	cb.router = nullptr;
-
+	/* 1. 收集所有"真正产生音频"的源(非场景/非过滤器/非转场)
+	 *    场景会混入其子源的音频, 若也给场景挂过滤器会导致同一份音频被路由两次 */
+	QVector<obs_source_t *> hosts;
 	obs_enum_sources(
 		[](void *param, obs_source_t *source) {
-			auto *d = static_cast<RouterCallbackData *>(param);
-			if (obs_source_get_type(source) != OBS_SOURCE_TYPE_SCENE)
+			auto *list = static_cast<QVector<obs_source_t *> *>(param);
+			const uint32_t flags = obs_source_get_output_flags(source);
+			if ((flags & OBS_SOURCE_AUDIO) == 0)
 				return true;
-			/* 每个场景创建一个独立过滤器实例 */
-			obs_source_t *filter =
-				obs_source_create_private("capcast_audio_router",
-							  "capcast-router", nullptr);
-			if (!filter)
+			const enum obs_source_type type =
+				obs_source_get_type(source);
+			if (type == OBS_SOURCE_TYPE_SCENE ||
+			    type == OBS_SOURCE_TYPE_FILTER ||
+			    type == OBS_SOURCE_TYPE_TRANSITION)
 				return true;
-			obs_source_filter_add(source, filter);
-			RouterAttachment att;
-			att.host = source;
-			att.filter = filter;
-			d->list->append(att);
-			CAPCAST_LOG(LOG_DEBUG, "router attached to scene %s",
-				    obs_source_get_name(source));
+			list->append(source);
 			return true;
 		},
-		&cb);
+		&hosts);
 
-	if (g_state.router_attachments.isEmpty()) {
-		CAPCAST_LOG(LOG_WARNING, "no scene found for audio routing");
+	/* 2. 枚举结束后再创建并挂接过滤器(此时源列表锁已释放) */
+	for (obs_source_t *host : hosts) {
+		obs_source_t *filter = obs_source_create_private(
+			"capcast_audio_router", "capcast-router", nullptr);
+		if (!filter) {
+			CAPCAST_LOG(LOG_WARNING, "router filter create failed");
+			continue;
+		}
+		obs_source_filter_add(host, filter);
+		RouterAttachment att;
+		att.host = host;
+		att.filter = filter;
+		g_state.router_attachments.append(att);
+		CAPCAST_LOG(LOG_INFO, "router attached to source: %s",
+			    obs_source_get_name(host));
 	}
 
-	CAPCAST_LOG(LOG_INFO, "audio direct-routed to %s (%d scenes)",
+	if (g_state.router_attachments.isEmpty()) {
+		CAPCAST_LOG(LOG_WARNING,
+			    "no audio source found for routing (共枚举 %d 个源)",
+			    (int)hosts.size());
+	}
+
+	CAPCAST_LOG(LOG_INFO, "audio direct-routed to %s (%d sources)",
 		    qUtf8Printable(dev_id),
 		    (int)g_state.router_attachments.size());
 	return {};

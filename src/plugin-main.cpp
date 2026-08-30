@@ -21,6 +21,7 @@ OBS_DECLARE_MODULE()
 OBS_MODULE_USE_DEFAULT_LOCALE(PLUGIN_NAME, "en-US")
 
 static CapCastSettings *g_settings = nullptr;
+static obs_hotkey_id g_hotkey_id = OBS_INVALID_HOTKEY_ID;
 
 /* ================= 工具菜单 ================= */
 
@@ -91,7 +92,10 @@ static void frontend_event(enum obs_frontend_event event, void *)
 				qApp, [] { resolve_and_start(); },
 				Qt::QueuedConnection);
 		}
-	} else if (event == OBS_FRONTEND_EVENT_EXIT) {
+	} else if (event == OBS_FRONTEND_EVENT_EXIT ||
+		   event == OBS_FRONTEND_EVENT_SCRIPTING_SHUTDOWN) {
+		/* OBS 开始关闭: 立刻停止投屏与音频路由, 移除场景上的过滤器,
+		 * 避免后续被 OBS 销毁时回调到我们已卸载的代码 */
 		capcast::stop_output();
 	}
 }
@@ -133,7 +137,7 @@ bool obs_module_load(void)
 	obs_frontend_add_event_callback(frontend_event, nullptr);
 
 	/* 全局热键: 一键开始/停止 */
-	obs_hotkey_register_frontend(
+	g_hotkey_id = obs_hotkey_register_frontend(
 		"capcast.toggle_output",
 		obs_module_text("CapCast.Hotkey.Toggle"), hotkey_callback,
 		nullptr);
@@ -144,10 +148,28 @@ bool obs_module_load(void)
 
 void obs_module_unload(void)
 {
+	blog(LOG_INFO, "[CapCast] unloading...");
+
+	/* 1. 先注销回调, 防止卸载后 OBS 再回调到已失效的代码 */
+	obs_frontend_remove_event_callback(frontend_event, nullptr);
+
+	/* 2. 注销热键 */
+	if (g_hotkey_id != OBS_INVALID_HOTKEY_ID) {
+		obs_hotkey_unregister(g_hotkey_id);
+		g_hotkey_id = OBS_INVALID_HOTKEY_ID;
+	}
+
+	/* 3. 停止投屏与音频路由(移除场景上的过滤器 + 释放 WASAPI) */
 	capcast::stop_output();
+
+	/* 4. 同步销毁设置对话框。
+	 *    注意: 不能用 deleteLater() —— 延迟删除会被推迟到插件卸载之后执行,
+	 *    届时析构函数所在的代码已失效, 会调用无效地址导致 OBS 崩溃。
+	 *    同步 delete 时代码仍然有效, 且会正确从父窗口(OBS 主窗口)的子列表中移除。 */
 	if (g_settings) {
-		g_settings->deleteLater();
+		delete g_settings;
 		g_settings = nullptr;
 	}
+
 	blog(LOG_INFO, "[CapCast] plugin unloaded");
 }
