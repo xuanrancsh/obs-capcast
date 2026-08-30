@@ -81,6 +81,7 @@ int cfg_display_index();                    /* 手动指定屏幕序号 */
 void cfg_set_display_index(int idx);
 
 QString cfg_audio_mode();                   /* "auto" | "manual" */
+void cfg_set_audio_mode(const QString &m);
 QString cfg_audio_device_id();              /* 手动指定音频设备 ID */
 QString cfg_audio_device_name();
 void cfg_set_audio_device(const QString &name, const QString &id);

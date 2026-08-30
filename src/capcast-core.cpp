@@ -196,12 +196,14 @@ static bool wasapi_start(const char *device_id)
 		switch (n) {
 		case 1:
 			return SPEAKERS_MONO;
+		case 3:
+			return SPEAKERS_2POINT1;
 		case 4:
-			return SPEAKERS_QUAD;
+			return SPEAKERS_4POINT0;
 		case 6:
-			return SPEAKERS_SURROUND5;
+			return SPEAKERS_5POINT1;
 		case 8:
-			return SPEAKERS_SURROUND7;
+			return SPEAKERS_7POINT1;
 		default:
 			return SPEAKERS_STEREO;
 		}
@@ -310,15 +312,20 @@ static struct obs_audio_data *router_filter_audio(void *, struct obs_audio_data 
 	return audio; /* 不改动原音频, 正常继续走 OBS 混音 */
 }
 
-static struct obs_source_info capcast_audio_router = {
-	.id = "capcast_audio_router",
-	.type = OBS_SOURCE_TYPE_FILTER,
-	.output_flags = OBS_SOURCE_AUDIO | OBS_SOURCE_DO_NOT_DUPLICATE,
-	.get_name = router_get_name,
-	.create = router_create,
-	.destroy = router_destroy,
-	.filter_audio = router_filter_audio,
-};
+/* obs_source_info 用零初始化+逐字段赋值(C++17 不支持指定初始化器) */
+static struct obs_source_info capcast_audio_router = {};
+static void capcast_router_register()
+{
+	capcast_audio_router.id = "capcast_audio_router";
+	capcast_audio_router.type = OBS_SOURCE_TYPE_FILTER;
+	capcast_audio_router.output_flags =
+		OBS_SOURCE_AUDIO | OBS_SOURCE_DO_NOT_DUPLICATE;
+	capcast_audio_router.get_name = router_get_name;
+	capcast_audio_router.create = router_create;
+	capcast_audio_router.destroy = router_destroy;
+	capcast_audio_router.filter_audio = router_filter_audio;
+	obs_register_source(&capcast_audio_router);
+}
 
 /* 开始直接音频路由: 初始化 WASAPI + 给所有场景挂过滤器 */
 static QString start_audio_routing(const QString &device_id)
