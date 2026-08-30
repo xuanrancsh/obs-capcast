@@ -9,7 +9,7 @@
 #include <obs-module.h>
 #include <obs-frontend-api.h>
 #include <obs.h>
-#include <util/config.h>
+#include <util/config-file.h> /* obs 31: 原 util/config.h 已合并到此 */
 
 #include <QGuiApplication>
 #include <QScreen>
