@@ -190,22 +190,18 @@ function(_check_dependencies)
       file(MAKE_DIRECTORY "${dependencies_dir}/${destination}")
       if(dependency STREQUAL obs-studio)
         file(ARCHIVE_EXTRACT INPUT "${dependencies_dir}/${file}" DESTINATION "${dependencies_dir}")
-        # Patch obs-studio bundled zlib: replace removed MSVC symbol __ms_vsnprintf
-        # with standard vsnprintf so it links on modern MSVC (VS2022+).
-        # The zlib source lives at <obs-studio>/deps/zlib*/ and is referenced by libobs.
-        file(GLOB_RECURSE _zlib_patch_files
-             "${dependencies_dir}/${destination}/*.c"
-             "${dependencies_dir}/${destination}/*.h")
-        set(_patched 0)
-        foreach(_zf ${_zlib_patch_files})
-          file(READ "${_zf}" _zc)
-          if(_zc MATCHES "__ms_vsnprintf")
-            string(REPLACE "__ms_vsnprintf" "vsnprintf" _zc "${_zc}")
-            file(WRITE "${_zf}" "${_zc}")
-            math(EXPR _patched "${_patched}+1")
-          endif()
-        endforeach()
-        message(STATUS "Patched __ms_vsnprintf in ${_patched} file(s)")
+        # Fix: obs-deps prebuilt libz.a (built with old MSVC) references __ms_vsnprintf,
+        # which modern MSVC ucrt (VS2019 16.10+) no longer exports. Inject stub into libobs
+        # that aliases __ms_vsnprintf to standard vsnprintf.
+        file(WRITE "${dependencies_dir}/${destination}/libobs/__ms_vsnprintf_stub.c"
+             "#include <stdarg.h>\n#include <stdio.h>\nint __ms_vsnprintf(char *buf, size_t n, const char *fmt, va_list ap){return vsnprintf(buf,n,fmt,ap);}\n")
+        file(READ "${dependencies_dir}/${destination}/libobs/CMakeLists.txt" _lc)
+        string(REPLACE
+          "  PRIVATE # cmake-format: sortable"
+          "  PRIVATE # cmake-format: sortable\n          __ms_vsnprintf_stub.c"
+          _lc "${_lc}")
+        file(WRITE "${dependencies_dir}/${destination}/libobs/CMakeLists.txt" "${_lc}")
+        message(STATUS "Injected __ms_vsnprintf stub into libobs")
       else()
         file(ARCHIVE_EXTRACT INPUT "${dependencies_dir}/${file}" DESTINATION "${dependencies_dir}/${destination}")
       endif()
