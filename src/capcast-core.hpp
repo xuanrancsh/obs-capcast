@@ -55,23 +55,41 @@ QVector<CapCastAudioDevice> enum_audio_devices();
 /* 自动选择"最像采集卡的音频端点": 关键字优先, 兜底第一个非音箱设备 */
 CapCastAudioDevice pick_default_audio();
 
-/* ---------- 一键推流 ---------- */
+/* ---------- 投屏 / 音频映射(各自独立控制) ----------
+ * 投屏与音频映射是两项互不依赖的功能, 可分别开启/关闭。
+ * 两者共用同一套目标设备配置, 但运行状态各自独立维护。 */
 
-/* 当前是否处于"推流中"(投影已开 / 音频已路由) */
+/* 投屏(全屏投影到采集卡副屏)是否正在运行 */
+bool is_projector_active();
+
+/* 音频映射(主混音 -> 采集卡端点)是否正在运行 */
+bool is_audio_active();
+
+/* 兼容/便捷判断: 任一项在跑即视为"推流中" */
 bool is_output_active();
 
-/* 一键开始: 打开全屏投影 + 直接软路由全部音频到采集卡
- *   audio_device_id 为空时由 pick_default_audio() 自动选择
- *   返回错误描述, 成功返回空串
- */
-QString start_output(int screen_index, const QString &audio_device_id,
-		     CapCastProjectorSource source);
+/* 只开投屏。返回错误描述, 成功返回空串。
+ * screen_index < 0 时由 pick_default_screen() 自动选择。
+ * 只会记录并关闭"本插件自己打开"的那个投影窗口。 */
+QString start_projector(int screen_index, CapCastProjectorSource source);
 
-/* 一键停止: 关闭全屏投影窗口 + 移除音频路由过滤器 + 释放 WASAPI */
-void stop_output();
+/* 只关投屏: 仅关闭本插件打开的那个投影窗口, 不影响用户手动打开的投影。 */
+void stop_projector();
 
-/* 关闭所有 OBS 全屏投影窗口(尽力而为) */
-void close_projector_windows();
+/* 只开音频映射(订阅 OBS 主混音 -> 采集卡端点)。返回错误描述, 成功返回空串。
+ * audio_device_id 为空时由 pick_default_audio() 自动选择。 */
+QString start_audio_mapping(const QString &audio_device_id);
+
+/* 只关音频映射(取消订阅 + 释放 WASAPI) */
+void stop_audio_mapping();
+
+/* 批量开始: 按 EnableProjector / EnableAudio 两个勾选分别执行。
+ * 两项都没勾选 -> 不做任何操作, 返回空串。
+ * 某项失败 -> 成功项保持运行, 返回汇总错误描述(便于界面如实提示)。 */
+QString start_enabled();
+
+/* 批量停止: 停掉当前正在运行的全部(投屏 + 音频), 与勾选状态无关。 */
+void stop_all();
 
 /* ---------- 配置持久化 ---------- */
 
@@ -113,7 +131,23 @@ void stop_audio_only();
 QString cfg_source();                       /* "program" | "preview" */
 void cfg_set_source(const QString &s);
 
-bool cfg_auto_start();                      /* 随 OBS 启动自动开始推流 */
+/* 投屏功能是否勾选(默认 true)。
+ * 既是"一键推流"的执行清单, 也是 OBS 自动启动时的执行清单。 */
+bool cfg_enable_projector();
+void cfg_set_enable_projector(bool v);
+
+/* 音频映射功能是否勾选(默认 true)。语义同上。 */
+bool cfg_enable_audio();
+void cfg_set_enable_audio(bool v);
+
+/* 总闸: OBS 启动时是否自动开始推流(默认 false)。
+ * 关闭时插件在 OBS 启动后完全不动作;
+ * 开启时按上面两个勾选分别启动(两项都没勾则不操作)。 */
+bool cfg_auto_start();
 void cfg_set_auto_start(bool v);
+
+/* 找不到采集卡副屏时, 是否自动把显示拓扑设为"扩展"(默认 true) */
+bool cfg_auto_extend();
+void cfg_set_auto_extend(bool v);
 
 } // namespace capcast

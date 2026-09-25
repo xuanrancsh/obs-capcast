@@ -37,30 +37,11 @@ static void open_settings_menu()
 
 /* ================= 一键推流(菜单/热键共用) ================= */
 
+/* 按"启用"勾选分别启动: 勾了投屏就开投屏, 勾了音频映射就开音频映射,
+ * 两项都没勾则不做任何操作(内部已处理, 这里只负责取错误提示)。 */
 static void resolve_and_start()
 {
-	/* 解析目标屏幕(遵循配置: 手动 or 自动) */
-	int screen_index = -1;
-	if (capcast::cfg_display_mode() == QStringLiteral("manual")) {
-		screen_index = capcast::cfg_display_index();
-	} else {
-		screen_index = capcast::pick_default_screen();
-	}
-
-	/* 解析目标音频设备 */
-	QString audio_id;
-	if (capcast::cfg_audio_mode() == QStringLiteral("manual")) {
-		audio_id = capcast::cfg_audio_device_id();
-	} else {
-		audio_id = capcast::pick_default_audio().id;
-	}
-
-	const CapCastProjectorSource src =
-		(capcast::cfg_source() == QStringLiteral("preview"))
-			? CapCastProjectorSource::Preview
-			: CapCastProjectorSource::Program;
-
-	const QString err = capcast::start_output(screen_index, audio_id, src);
+	const QString err = capcast::start_enabled();
 	if (!err.isEmpty()) {
 		blog(LOG_WARNING, "[CapCast] start failed: %s",
 		     qUtf8Printable(err));
@@ -70,7 +51,7 @@ static void resolve_and_start()
 static void toggle_output()
 {
 	if (capcast::is_output_active()) {
-		capcast::stop_output();
+		capcast::stop_all(); /* 停止全部正在运行的, 与勾选状态无关 */
 	} else {
 		resolve_and_start();
 	}
@@ -89,7 +70,12 @@ static void hotkey_callback(void *, obs_hotkey_id, obs_hotkey_t *, bool pressed)
 static void frontend_event(enum obs_frontend_event event, void *)
 {
 	if (event == OBS_FRONTEND_EVENT_FINISHED_LOADING) {
-		/* OBS 启动完成后, 按配置自动开始 */
+		/* OBS 启动完成后, 仅当"OBS 启动时自动开始"打开才动作。
+		 * 语义:
+		 *   - 该总闸关闭 -> 插件完全不启动, 不做任何事;
+		 *   - 该总闸开启 -> 按上次勾选的项目分别启动
+		 *     (只勾了音频就只开音频, 只勾了投屏就只开投屏, 都勾就都开);
+		 *   - 上次两项都没勾 -> start_enabled() 内部直接跳过, 不操作。 */
 		if (capcast::cfg_auto_start()) {
 			blog(LOG_INFO, "[CapCast] auto start on launch");
 			QMetaObject::invokeMethod(
@@ -100,7 +86,7 @@ static void frontend_event(enum obs_frontend_event event, void *)
 		   event == OBS_FRONTEND_EVENT_SCRIPTING_SHUTDOWN) {
 		/* OBS 开始关闭: 立刻停止投屏与音频路由, 移除场景上的过滤器,
 		 * 避免后续被 OBS 销毁时回调到我们已卸载的代码 */
-		capcast::stop_output();
+		capcast::stop_all();
 	}
 }
 
@@ -110,11 +96,13 @@ bool obs_module_load(void)
 {
 	blog(LOG_INFO, "%s %s loaded", PLUGIN_DISPLAY_NAME, PLUGIN_VERSION);
 
-	/* 默认配置(首次运行时写入) */
+	/* 默认配置(首次运行时写入)。
+	 * 注意: 不要再写 `if (!cfg_auto_start()) cfg_set_auto_start(false)`
+	 * —— 那是恒等操作(为 false 时又写一次 false), 毫无意义。
+	 * 功能勾选(EnableProjector/EnableAudio)默认 true, 由 core 内部按
+	 * "从未设置过"处理, 这里不需要预写。 */
 	if (capcast::cfg_source().isEmpty())
 		capcast::cfg_set_source(QStringLiteral("program"));
-	if (!capcast::cfg_auto_start())
-		capcast::cfg_set_auto_start(false);
 
 	/* 工具菜单: 设置面板 */
 	QMainWindow *main_window =
@@ -159,15 +147,15 @@ void obs_module_unload(void)
 
 	/* 3. 只停止音频路由并释放 WASAPI, 绝不触碰 Qt 控件。
 	 *
-	 *    这里原来是 capcast::stop_output(), 它会走 close_projector_windows()
-	 *    去遍历 QApplication::topLevelWidgets() 并对投影窗口调用 close()。
+	 *    这里若走 capcast::stop_all(), 它会去遍历
+	 *    QApplication::topLevelWidgets() 并对投影窗口调用 close()。
 	 *    卸载阶段 OBS 正在销毁主窗口与各投影窗口, close() 会让 Qt 把事件
 	 *    派发到正在析构/已析构的对象上 —— 虚调用打到被释放对象的 vtable,
 	 *    于是每次退出 OBS 都崩在 obs_module_unload:
 	 *      capcast.dll!obs_module_unload -> qt6core -> qt6core -> <invalid>
 	 *
 	 *    投影窗口由 OBS 自己在退出时销毁; 正常停止(菜单/热键/OBS 退出事件)
-	 *    仍会走 stop_output() 去关投影。 */
+	 *    仍会走 stop_all() 去关投影。 */
 	capcast::stop_audio_only();
 
 	/* 4. 设置对话框不在这里 delete。

@@ -29,21 +29,33 @@ private slots:
 	void onStopClicked();
 	void onVolumeChanged(int value);
 	void onTrackChanged(int index);
+	/* 单项独立启停: 投屏 / 音频映射各自一个按钮, 文字随运行状态切换 */
+	void onProjectorToggleClicked();
+	void onAudioToggleClicked();
 
 private:
 	void buildUi();
 	void loadSettings();
 	void saveSettings();
 	void refreshStatus();
+	void refreshToggleButtons();
 	void closeEvent(QCloseEvent *event) override; /* 关闭时自动保存 */
 
 	QComboBox *displayCombo = nullptr;
+	QCheckBox *enableProjCheck = nullptr;
+	QPushButton *projToggleBtn = nullptr;
+
 	QComboBox *audioCombo = nullptr;
 	QComboBox *trackCombo = nullptr;
-	QComboBox *sourceCombo = nullptr;
 	QSlider *volumeSlider = nullptr;
 	QLabel *volumeLabel = nullptr;
+	QCheckBox *enableAudioCheck = nullptr;
+	QPushButton *audioToggleBtn = nullptr;
+
+	QComboBox *sourceCombo = nullptr;
 	QCheckBox *autoStartCheck = nullptr;
+	QCheckBox *autoExtendCheck = nullptr;
+
 	QPushButton *startBtn = nullptr;
 	QPushButton *stopBtn = nullptr;
 	QLabel *statusLabel = nullptr;

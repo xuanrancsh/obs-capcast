@@ -30,6 +30,8 @@
 #include <QScreen>
 #include <QApplication>
 #include <QWidget>
+#include <QPointer>
+#include <QSet>
 
 #include <atomic>
 
@@ -50,12 +52,35 @@
 /* ================= 内部状态 ================= */
 namespace {
 
-struct OutputState {
-	bool active = false;
-	QString last_error;
-};
+/* 投屏 与 音频映射 各自的运行状态(两项互不依赖, 可单独开关)。
+ * 读写跨 UI 线程 / OBS 音频线程 / 模块卸载路径, 故用 atomic。 */
+std::atomic<bool> g_proj_active{false};
+std::atomic<bool> g_audio_active{false};
 
-OutputState g_state;
+/* 本插件自己打开的那个全屏投影窗口。
+ *
+ * OBS 没有提供关闭投影的 API, 只能自己定位窗口。旧实现无差别遍历
+ * QApplication::topLevelWidgets() 关闭所有 OBSProjector —— 那会把用户
+ * 自己在 OBS 里打开的预览/多视图投影一并关掉。
+ *
+ * 这里用 QPointer 记住"我们打开的那一个":
+ *   - obs_frontend_open_projector() 内部是阻塞式调用(WaitConnection),
+ *     返回时窗口已创建完毕, 因此可以在调用后立刻做"前后差集"定位它;
+ *   - QPointer 保证窗口被用户手动关掉后自动置空, 不会留下悬垂指针。 */
+QPointer<QWidget> g_projector;
+
+/* 收集当前所有 OBS 全屏投影窗口(OBSProjector 顶层窗口) */
+static QSet<QWidget *> collect_projectors()
+{
+	QSet<QWidget *> out;
+	if (!qApp)
+		return out;
+	for (QWidget *w : QApplication::topLevelWidgets()) {
+		if (w && w->inherits("OBSProjector"))
+			out.insert(w);
+	}
+	return out;
+}
 
 /* 送到采集卡的音量(百分比, 100 = 原始主混音音量)。
  * 音频线程(on_master_audio)读取, UI 线程(设置面板)写入, 故用 atomic。 */
@@ -741,72 +766,187 @@ CapCastAudioDevice pick_default_audio()
 	return devices.first();
 }
 
-/* ================= 一键推流 ================= */
+/* ================= 投屏 / 音频映射(各自独立控制) ================= */
+
+bool is_projector_active()
+{
+	return g_proj_active.load(std::memory_order_relaxed);
+}
+
+bool is_audio_active()
+{
+	return g_audio_active.load(std::memory_order_relaxed);
+}
 
 bool is_output_active()
 {
-	return g_state.active;
+	return is_projector_active() || is_audio_active();
 }
 
-QString start_output(int screen_index, const QString &audio_device_id,
-		     CapCastProjectorSource source)
+/* 解析目标屏幕序号: <0 表示自动选择 */
+static int resolve_screen_index()
 {
-	g_state.last_error.clear();
+	if (cfg_display_mode() == QStringLiteral("manual"))
+		return cfg_display_index();
+	return -1;
+}
 
-	/* 1. 校验目标屏幕存在 */
-	const auto screens = enum_screens();
-	if (screen_index < 0 || screen_index >= screens.size()) {
-		g_state.last_error = QStringLiteral("采集卡副屏未找到(序号 %1 不存在)").arg(screen_index);
-		return g_state.last_error;
+/* 解析目标音频设备 ID: 空串表示自动选择 */
+static QString resolve_audio_device()
+{
+	if (cfg_audio_mode() == QStringLiteral("manual"))
+		return cfg_audio_device_id();
+	return QString();
+}
+
+static CapCastProjectorSource resolve_source()
+{
+	return (cfg_source() == QStringLiteral("preview"))
+		       ? CapCastProjectorSource::Preview
+		       : CapCastProjectorSource::Program;
+}
+
+QString start_projector(int screen_index, CapCastProjectorSource source)
+{
+	/* 已在运行则先停掉旧的, 避免残留多个投影窗口 */
+	if (g_proj_active.load(std::memory_order_relaxed))
+		stop_projector();
+
+	/* 未指定 -> 自动选择 */
+	if (screen_index < 0)
+		screen_index = pick_default_screen();
+
+	auto screens = enum_screens();
+
+	/* 找不到副屏且允许自动扩展 -> 把显示拓扑设为"扩展"后重试一次 */
+	if ((screen_index < 0 || screen_index >= screens.size()) &&
+	    cfg_auto_extend()) {
+		CAPCAST_LOG(LOG_INFO,
+			    "capture screen not found, extending display...");
+		ensure_display_extend();
+		screens = enum_screens();
+		screen_index = pick_default_screen();
 	}
 
-	/* 2. 打开全屏投影(节目/预览)到采集卡副屏 */
+	if (screen_index < 0 || screen_index >= screens.size()) {
+		return QStringLiteral("采集卡副屏未找到(序号 %1 不存在)")
+			.arg(screen_index);
+	}
+
 	/* obs 31: type 为字符串, "StudioProgram"=节目, nullptr=默认预览 */
 	const char *projector_type =
 		(source == CapCastProjectorSource::Program)
 			? "StudioProgram"
 			: nullptr;
+
+	/* 打开前快照已有投影, 打开后按差集定位"我们新开的这一个"。
+	 * obs_frontend_open_projector() 内部是阻塞调用, 返回时窗口已创建完。 */
+	const QSet<QWidget *> before = collect_projectors();
 	obs_frontend_open_projector(projector_type, screen_index, nullptr,
 				    nullptr);
-	CAPCAST_LOG(LOG_INFO, "projector opened on screen %d (%s)", screen_index,
-		    qUtf8Printable(screens.at(screen_index).name));
 
-	/* 3. 音频路由到采集卡(订阅 OBS 主混音, 独立于 OBS 混音器设置) */
-	const QString err = start_audio_routing(audio_device_id);
-	if (!err.isEmpty()) {
-		g_state.last_error =
-			QStringLiteral("投影已打开, 但音频路由失败: %1").arg(err);
+	QWidget *mine = nullptr;
+	const QSet<QWidget *> after = collect_projectors();
+	for (QWidget *w : after) {
+		if (!before.contains(w)) {
+			mine = w;
+			break;
+		}
 	}
 
-	g_state.active = true;
+	/* 没检测到新增窗口 -> 认定打开失败并如实报错。
+	 *
+	 * 关键: 这种情况绝不记录任何窗口、也不置 active —— 否则会把用户
+	 * 自己打开的投影误当成"我们的", 停止时就会误关掉它(旧实现正是
+	 * 无差别关闭所有 OBSProjector, 会误伤用户手动开的预览/多视图投影)。 */
+	if (!mine) {
+		CAPCAST_LOG(LOG_WARNING, "projector window was not created");
+		return QStringLiteral("投影窗口未能打开(OBS 未创建新的投影窗口)");
+	}
+
+	g_projector = mine;
+	g_proj_active.store(true, std::memory_order_relaxed);
+	CAPCAST_LOG(LOG_INFO, "projector started on screen %d (%s)",
+		    screen_index,
+		    qUtf8Printable(screens.at(screen_index).name));
 	return {};
 }
 
-void stop_output()
+void stop_projector()
 {
-	close_projector_windows();
-	stop_audio_routing();
-	g_state.active = false;
+	/* 只关我们自己打开的那一个。
+	 *
+	 * QPointer 为空说明它已被用户或 OBS 关掉了 —— 那就什么都不用做。
+	 * 绝不去关闭别的投影窗口。
+	 *
+	 * qApp 为空(卸载/退出尾声)时同样不碰 Qt: OBS 正在销毁窗口,
+	 * 此时 close() 会把事件派发到已析构对象导致崩溃(旧版退出必崩的根因),
+	 * 交给 OBS 自己销毁即可。 */
+	if (!g_projector.isNull() && qApp) {
+		CAPCAST_LOG(LOG_INFO, "closing our projector window");
+		g_projector->close();
+	}
+
+	g_projector = nullptr;
+	g_proj_active.store(false, std::memory_order_relaxed);
 }
 
-void close_projector_windows()
+QString start_audio_mapping(const QString &audio_device_id)
 {
-	/* 只在 Qt 应用实例仍存活时执行。
-	 * 退出/卸载阶段 OBS 正在销毁主窗口与投影窗口, 此时遍历或 close()
-	 * QWidget 会让 Qt 把事件派发到已析构的对象上, 直接崩溃
-	 * (崩溃栈: obs_module_unload -> qt6core x2 -> 无效堆地址, 即虚调用
-	 * 打到了被释放对象的 vtable)。 */
-	if (!qApp)
-		return;
+	if (g_audio_active.load(std::memory_order_relaxed))
+		stop_audio_mapping();
 
-	/* OBS 全屏投影是 OBSProjector(QDialog) 顶层窗口, 通过类名定位并关闭 */
-	const QWidgetList widgets = QApplication::topLevelWidgets();
-	for (QWidget *w : widgets) {
-		if (w && w->inherits("OBSProjector")) {
-			CAPCAST_LOG(LOG_INFO, "closing projector window");
-			w->close();
-		}
+	/* 如实返回错误 —— 旧实现把失败吞掉(恒 return {}), 导致音频其实没
+	 * 起来而界面显示正常。 */
+	const QString err = start_audio_routing(audio_device_id);
+	if (!err.isEmpty()) {
+		g_audio_active.store(false, std::memory_order_relaxed);
+		return err;
 	}
+	g_audio_active.store(true, std::memory_order_relaxed);
+	return {};
+}
+
+void stop_audio_mapping()
+{
+	stop_audio_routing();
+	g_audio_active.store(false, std::memory_order_relaxed);
+}
+
+QString start_enabled()
+{
+	const bool want_proj = cfg_enable_projector();
+	const bool want_audio = cfg_enable_audio();
+
+	if (!want_proj && !want_audio) {
+		CAPCAST_LOG(LOG_INFO,
+			    "start skipped: neither projector nor audio enabled");
+		return {};
+	}
+
+	QStringList errors;
+
+	if (want_proj) {
+		const QString e =
+			start_projector(resolve_screen_index(), resolve_source());
+		if (!e.isEmpty())
+			errors << QStringLiteral("投屏: %1").arg(e);
+	}
+
+	if (want_audio) {
+		const QString e = start_audio_mapping(resolve_audio_device());
+		if (!e.isEmpty())
+			errors << QStringLiteral("音频映射: %1").arg(e);
+	}
+
+	/* 部分失败时, 成功那一项保持运行, 只把失败原因如实返回给界面 */
+	return errors.join(QStringLiteral("；"));
+}
+
+void stop_all()
+{
+	stop_projector();
+	stop_audio_mapping();
 }
 
 /* ================= 配置持久化 =================
@@ -945,7 +1085,8 @@ void stop_audio_only()
 	 *
 	 * 投影窗口则由 OBS 自己在退出时销毁。 */
 	stop_audio_routing();
-	g_state.active = false;
+	g_audio_active.store(false, std::memory_order_relaxed);
+	g_proj_active.store(false, std::memory_order_relaxed);
 }
 
 QString cfg_source()
@@ -966,6 +1107,46 @@ bool cfg_auto_start()
 void cfg_set_auto_start(bool v)
 {
 	config_set_bool(user_config(), CFG_SECTION, "AutoStart", v);
+	cfg_flush();
+}
+
+/* 功能勾选默认 true(首次安装即可用)。
+ * 用 has_user_value 区分"用户主动取消勾选(false)"与"从未设置过",
+ * 否则每次启动都会把用户取消的勾又勾回来。 */
+bool cfg_enable_projector()
+{
+	if (!config_has_user_value(user_config(), CFG_SECTION,
+				   "EnableProjector"))
+		return true;
+	return config_get_bool(user_config(), CFG_SECTION, "EnableProjector");
+}
+void cfg_set_enable_projector(bool v)
+{
+	config_set_bool(user_config(), CFG_SECTION, "EnableProjector", v);
+	cfg_flush();
+}
+
+bool cfg_enable_audio()
+{
+	if (!config_has_user_value(user_config(), CFG_SECTION, "EnableAudio"))
+		return true;
+	return config_get_bool(user_config(), CFG_SECTION, "EnableAudio");
+}
+void cfg_set_enable_audio(bool v)
+{
+	config_set_bool(user_config(), CFG_SECTION, "EnableAudio", v);
+	cfg_flush();
+}
+
+bool cfg_auto_extend()
+{
+	if (!config_has_user_value(user_config(), CFG_SECTION, "AutoExtend"))
+		return true;
+	return config_get_bool(user_config(), CFG_SECTION, "AutoExtend");
+}
+void cfg_set_auto_extend(bool v)
+{
+	config_set_bool(user_config(), CFG_SECTION, "AutoExtend", v);
 	cfg_flush();
 }
 
