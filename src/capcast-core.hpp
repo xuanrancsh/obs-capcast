@@ -13,13 +13,24 @@
 #include <QString>
 #include <QStringList>
 #include <QVector>
+#include <QSize>
 
 /* 屏幕信息 */
 struct CapCastScreen {
 	int index = -1;   /* Qt 屏幕序号, 与 OBS 全屏投影的 monitor 参数一致 */
 	QString name;     /* 设备名, Windows 上形如 "\\.\DISPLAY2" */
-	QString geometry; /* 形如 "1920x1080@60" */
+	QString geometry; /* 物理分辨率, 形如 "3840x2160@60" */
 	bool isPrimary = false;
+
+	/* 分辨率细节:
+	 *   physical = 显示器真实像素(如 4K 屏 = 3840x2160)
+	 *   logical  = Qt 报告的像素, 已被 Windows 系统缩放除过(4K@300% -> 1280x720)
+	 *   scale    = 系统缩放倍数(1.0=100%, 3.0=300%)
+	 * 注意: 只有 physical 是显示器的真实能力; logical 仅供排查用,
+	 *       插件投屏不受它影响(投影窗口是全屏放到该物理显示器上的)。 */
+	QSize physical; /* 物理像素 */
+	QSize logical;  /* 逻辑像素(Qt 报告值) */
+	double scale = 1.0;
 };
 
 /* WASAPI 输出端点(渲染设备)信息 */

@@ -36,6 +36,16 @@ int populate_screens(QComboBox *combo, int current_index)
 					.arg(sc.name, sc.geometry);
 		if (sc.isPrimary)
 			label += QStringLiteral("  (主屏)");
+		/* 系统缩放说明: geometry 已是物理分辨率, 这里补一句为什么
+		 * OBS 会把它"看小了", 消除 4K 屏被显示成 1280x720 的误解 */
+		if (sc.scale > 1.01) {
+			label += QStringLiteral("  ") +
+				 QString(obs_module_text(
+					 "CapCast.Settings.Display.Scaled"))
+					 .arg(qRound(sc.scale * 100.0))
+					 .arg(sc.logical.width())
+					 .arg(sc.logical.height());
+		}
 		combo->addItem(label, sc.index);
 		if (sc.index == current_index)
 			select_row = combo->count() - 1;

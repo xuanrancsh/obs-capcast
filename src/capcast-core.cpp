@@ -32,6 +32,7 @@
 #include <QWidget>
 #include <QPointer>
 #include <QSet>
+#include <QHash>
 
 #include <atomic>
 
@@ -571,23 +572,118 @@ static void stop_audio_routing()
 
 /* ================= 显示器 ================= */
 
+#ifdef _WIN32
+/* ---- Windows: 查询每个显示器的真实物理分辨率 ----
+ *
+ * 为什么需要:
+ *   Qt 的 QScreen::size() 返回"逻辑像素"。若宿主进程(OBS)不是 per-monitor
+ *   DPI 感知进程, Windows 会对它做 DPI 虚拟化, 此时 size() 是已被系统缩放
+ *   除过的值, 而 devicePixelRatio() 恒为 1.0 —— 于是 4K 屏(3840x2160)在 300%
+ *   缩放下会被报成 1280x720, 且凭 Qt 自身无法还原。
+ *
+ *   EnumDisplaySettings(ENUM_CURRENT_SETTINGS) 返回的是显示器当前的真实
+ *   显示模式(物理像素), 不受调用进程的 DPI 感知状态影响, 因此拿它作为
+ *   物理分辨率的权威来源最稳妥 —— 既能在"非感知"时还原 4K, 也不会在
+ *   "已感知"(此时 Qt 报的就是物理值)时错误地再乘一次缩放。 */
+namespace {
+
+struct WinMonitorInfo {
+	QHash<QString, QSize> physicalByName; /* "\\.\DISPLAY2" -> 物理像素 */
+	QVector<QSize> physicalByOrder;       /* EnumDisplayMonitors 顺序 */
+};
+
+BOOL CALLBACK capcast_monitor_enum_proc(HMONITOR hmon, HDC, LPRECT, LPARAM lparam)
+{
+	auto *out = reinterpret_cast<WinMonitorInfo *>(lparam);
+
+	MONITORINFOEXW info{};
+	info.cbSize = sizeof(info);
+	if (!GetMonitorInfoW(hmon, &info))
+		return TRUE;
+
+	QSize phys;
+	DEVMODEW dm{};
+	dm.dmSize = sizeof(dm);
+	if (EnumDisplaySettingsW(info.szDevice, ENUM_CURRENT_SETTINGS, &dm)) {
+		phys = QSize(static_cast<int>(dm.dmPelsWidth),
+			     static_cast<int>(dm.dmPelsHeight));
+	}
+
+	const QString dev = QString::fromWCharArray(info.szDevice);
+	out->physicalByName.insert(dev, phys);
+	out->physicalByOrder.append(phys);
+	return TRUE;
+}
+
+WinMonitorInfo win_monitor_info()
+{
+	WinMonitorInfo out;
+	if (!EnumDisplayMonitors(nullptr, nullptr,
+				 capcast_monitor_enum_proc,
+				 reinterpret_cast<LPARAM>(&out)))
+		return {};
+	return out;
+}
+
+} // namespace
+#endif // _WIN32
+
 namespace capcast {
 
 QVector<CapCastScreen> enum_screens()
 {
 	QVector<CapCastScreen> out;
 	const auto screens = QGuiApplication::screens();
+
+#ifdef _WIN32
+	const WinMonitorInfo win = win_monitor_info();
+#endif
+
 	for (int i = 0; i < screens.size(); ++i) {
 		const QScreen *s = screens.at(i);
 		CapCastScreen sc;
 		sc.index = i;
 		sc.name = s->name();
 		sc.isPrimary = (s == QGuiApplication::primaryScreen());
-		const QSize sz = s->size();
+
+	const QSize logical = s->size();
+
+	/* 物理分辨率: 以 Windows 报告的当前显示模式为准权威值。
+	 * 拿不到(非 Windows 或 API 失败)时才退回 Qt 的 size()。 */
+	QSize physical = logical;
+#ifdef _WIN32
+	{
+		bool have = false;
+		QSize p;
+		auto it = win.physicalByName.constFind(sc.name);
+		if (it != win.physicalByName.constEnd()) {
+			p = *it;
+			have = true;
+		} else if (i < win.physicalByOrder.size()) {
+			/* 设备名对不上(Qt 可能返回友好名)时, 按枚举顺序兜底 */
+			p = win.physicalByOrder.at(i);
+			have = true;
+		}
+		if (have && p.width() > 0 && p.height() > 0)
+			physical = p;
+	}
+#endif
+
+	/* 缩放倍数 = 物理 / 逻辑。OBS 已是 DPI 感知时两者相等 -> 1.0(不会误放大);
+	 * 非感知时 4K@300% 会得到 3.0, 正好解释"为何显示成 1280x720"。 */
+	const double scale = (logical.width() > 0)
+				     ? static_cast<double>(physical.width()) /
+					       static_cast<double>(logical.width())
+				     : 1.0;
+
+	sc.logical = logical;
+	sc.physical = physical;
+	sc.scale = (scale >= 1.0) ? scale : 1.0;
+
 		int refresh = static_cast<int>(s->refreshRate());
-		sc.geometry = QString("%1x%2@%3")
-				      .arg(sz.width())
-				      .arg(sz.height())
+		sc.geometry = QStringLiteral("%1x%2@%3")
+				      .arg(physical.width())
+				      .arg(physical.height())
 				      .arg(refresh);
 		out.append(sc);
 	}
@@ -866,9 +962,16 @@ QString start_projector(int screen_index, CapCastProjectorSource source)
 
 	g_projector = mine;
 	g_proj_active.store(true, std::memory_order_relaxed);
-	CAPCAST_LOG(LOG_INFO, "projector started on screen %d (%s)",
-		    screen_index,
-		    qUtf8Printable(screens.at(screen_index).name));
+	{
+		const CapCastScreen sc = screens.at(screen_index);
+		CAPCAST_LOG(LOG_INFO,
+			    "projector started on screen %d: %s physical %dx%d "
+			    "(Qt logical %dx%d, system scale %.0f%%)",
+			    screen_index, qUtf8Printable(sc.name),
+			    sc.physical.width(), sc.physical.height(),
+			    sc.logical.width(), sc.logical.height(),
+			    sc.scale * 100.0);
+	}
 	return {};
 }
 
