@@ -22,11 +22,12 @@
 
 namespace {
 
-/* 把 Qt 屏幕列表填进下拉框, 返回当前选中的屏幕序号(-1 表示自动) */
+/* 把 Qt 屏幕列表填进下拉框, 返回当前选中的屏幕序号(-1 表示未选择)。
+ * 第一项是"未选择": 没有自动检测 —— 插件不替用户猜哪块是采集卡。 */
 int populate_screens(QComboBox *combo, int current_index)
 {
 	combo->clear();
-	combo->addItem(QObject::tr("自动检测"), -1);
+	combo->addItem(obs_module_text("CapCast.Settings.NotSelected"), -1);
 
 	int select_row = 0;
 	const auto screens = capcast::enum_screens();
@@ -55,11 +56,12 @@ int populate_screens(QComboBox *combo, int current_index)
 	return combo->currentData().toInt();
 }
 
-/* 把 WASAPI 输出端点列表填进下拉框, 返回当前选中的设备 ID */
+/* 把 WASAPI 输出端点列表填进下拉框, 返回当前选中的设备 ID(空=未选择) */
 QString populate_audio_devices(QComboBox *combo, const QString &current_id)
 {
 	combo->clear();
-	combo->addItem(QObject::tr("自动检测"), QString());
+	combo->addItem(obs_module_text("CapCast.Settings.NotSelected"),
+		       QString());
 
 	int select_row = 0;
 	const auto devices = capcast::enum_audio_devices();
@@ -91,11 +93,11 @@ void CapCastSettings::buildUi()
 
 	displayCombo = new QComboBox(this);
 	displayCombo->setToolTip(QObject::tr(
-		"选择采集卡副屏。自动检测会优先选名称含采集卡关键字的副屏, 否则选第一个非主屏"));
+		"选择采集卡副屏。必须手动指定 —— 插件不会自动替你猜, 猜错了会把画面投到别的屏。选好后会被记住, 以后一直用这一块"));
 
 	audioCombo = new QComboBox(this);
 	audioCombo->setToolTip(QObject::tr(
-		"选择采集卡音频端点(USB 声卡/HDMI 采集卡的音频输出)。自动检测会智能选择非音箱的采集设备"));
+		"选择采集卡音频端点(USB 声卡/HDMI 采集卡的音频输出)。必须手动指定 —— 插件不会自动替你挑, 挑错了声音会走错设备(可能出现混响)。选好后会被记住"));
 
 	/* 输出音量滑块: 0-200%, 默认 50%。只影响送到采集卡的声音 */
 	volumeSlider = new QSlider(Qt::Horizontal, this);
@@ -163,7 +165,7 @@ void CapCastSettings::buildUi()
 	autoStartCheck = new QCheckBox(
 		obs_module_text("CapCast.Settings.AutoStart"), this);
 	autoStartCheck->setToolTip(QObject::tr(
-		"总闸。勾选后 OBS 启动时才自动开始; 启动时按上面两项的勾选分别执行(上次只勾了音频就只开音频)。不勾选则 OBS 启动后插件完全不动"));
+		"总闸。勾选后 OBS 启动时才自动开始; 启动时按上面两项的勾选分别执行(上次只勾了音频就只开音频)。某一项没选目标设备就跳过该项, 不影响另一项。不勾选则 OBS 启动后插件完全不动"));
 
 	autoExtendCheck = new QCheckBox(
 		obs_module_text("CapCast.Settings.AutoExtend"), this);
@@ -267,6 +269,12 @@ void CapCastSettings::toggleShowHide()
 
 void CapCastSettings::refreshDevices()
 {
+	/* 采集卡可能插着但没被 Windows 点亮成副屏 —— 那样它在屏幕列表里
+	 * 根本不存在, 下拉框里也就选不到。既然现在强制手动选择, 就必须保证
+	 * "选得到": 允许自动扩展时, 屏幕上只有一块屏就先扩展一次再枚举。 */
+	if (capcast::cfg_auto_extend() && capcast::enum_screens().size() <= 1)
+		capcast::ensure_display_extend();
+
 	/* 记住当前选择, 刷新后尽量恢复 */
 	const int cur_screen = displayCombo->currentData().toInt();
 	populate_screens(displayCombo, cur_screen);
@@ -276,20 +284,13 @@ void CapCastSettings::refreshDevices()
 
 void CapCastSettings::loadSettings()
 {
-	/* 显示目标: 手动 index 或自动 */
-	if (capcast::cfg_display_mode() == QStringLiteral("manual")) {
-		populate_screens(displayCombo, capcast::cfg_display_index());
-	} else {
-		populate_screens(displayCombo, -1);
-	}
+	/* 显示目标: 上次选过的那块屏(按名称解析; 老配置只有序号也能带过来)。
+	 * 没选过或那块屏不在了 -> 落在"未选择"上, 用户重新选。 */
+	populate_screens(displayCombo,
+			 capcast::resolve_screen_binding().index);
 
-	/* 音频目标: 手动设备 id 或自动 */
-	if (capcast::cfg_audio_mode() == QStringLiteral("manual")) {
-		populate_audio_devices(audioCombo,
-				       capcast::cfg_audio_device_id());
-	} else {
-		populate_audio_devices(audioCombo, QString());
-	}
+	/* 音频目标: 同理, 解析出上次选的那个端点的**当前** ID */
+	populate_audio_devices(audioCombo, capcast::resolve_audio_binding().id);
 
 	const QString src = capcast::cfg_source();
 	sourceCombo->setCurrentIndex(src == QStringLiteral("preview") ? 1 : 0);
@@ -322,14 +323,11 @@ void CapCastSettings::saveSettings()
 	capcast::cfg_set_enable_audio(enableAudioCheck->isChecked());
 	capcast::cfg_set_auto_extend(autoExtendCheck->isChecked());
 
-	/* 显示目标 */
+	/* 显示目标: 选了就按名称固化(序号会在插拔后漂移, 不能当主键);
+	 * 选了"未选择"则把名称和序号一起清空, 否则下次又按旧名字恢复。 */
 	const int screen_idx = displayCombo->currentData().toInt();
 	if (screen_idx >= 0) {
-		capcast::cfg_set_display_mode(QStringLiteral("manual"));
 		capcast::cfg_set_display_index(screen_idx);
-		/* 同时按名称固化绑定。
-		 * 序号会在插拔后漂移(少一块屏时, 同一个序号就指向另一块屏),
-		 * 所以真正用来恢复的是设备名, 序号只作旧配置兼容。 */
 		const auto screens = capcast::enum_screens();
 		for (const auto &sc : screens) {
 			if (sc.index == screen_idx) {
@@ -338,16 +336,17 @@ void CapCastSettings::saveSettings()
 			}
 		}
 	} else {
-		capcast::cfg_set_display_mode(QStringLiteral("auto"));
+		capcast::bind_screen(QString());
+		capcast::cfg_set_display_index(-1);
 	}
 
-	/* 音频目标 */
+	/* 音频目标: 同理, 未选择就真的清空(名字也要清, 否则会被按名找回) */
 	const QString dev_id = audioCombo->currentData().toString();
 	if (!dev_id.isEmpty()) {
-		capcast::cfg_set_audio_mode(QStringLiteral("manual"));
-		capcast::cfg_set_audio_device(audioCombo->currentText(), dev_id);
+		capcast::cfg_set_audio_device(audioCombo->currentText(),
+					      dev_id);
 	} else {
-		capcast::cfg_set_audio_mode(QStringLiteral("auto"));
+		capcast::cfg_set_audio_device(QString(), QString());
 	}
 
 	/* 输出音量(运行时已即时生效, 这里只负责落盘) */
@@ -388,40 +387,48 @@ void CapCastSettings::refreshStatus()
 				     ? obs_module_text("CapCast.Status.On")
 				     : obs_module_text("CapCast.Status.Off"));
 
-	/* 显示识别结果 */
-	const int screen_idx = displayCombo->currentData().toInt();
-	if (screen_idx >= 0) {
-		const auto screens = capcast::enum_screens();
-		for (const auto &sc : screens) {
-			if (sc.index == screen_idx) {
-				text += QStringLiteral("\n[%1] %2 %3")
-						.arg(obs_module_text("CapCast.Status.Display"),
-						     sc.name, sc.geometry);
-				break;
+	/* 目标设备状态: 用绑定解析结果, 如实区分"已选 / 未选 / 选过但找不到"。
+	 * 三种状态不能混着显示 —— 用户得一眼看出"为什么这项没起来"。 */
+	{
+		const auto b = capcast::resolve_screen_binding();
+		QString val;
+		if (b.match == CapCastDeviceMatch::Unbound) {
+			val = obs_module_text("CapCast.Status.NotSelected");
+		} else if (b.match == CapCastDeviceMatch::Missing) {
+			val = QString(obs_module_text(
+					      "CapCast.Status.TargetMissing"))
+				      .arg(b.name);
+		} else {
+			val = b.name;
+			const auto screens = capcast::enum_screens();
+			for (const auto &sc : screens) {
+				if (sc.index == b.index) {
+					val = QStringLiteral("%1 %2").arg(
+						sc.name, sc.geometry);
+					break;
+				}
 			}
 		}
-	} else {
-		const int found = capcast::pick_default_screen();
 		text += QStringLiteral("\n[%1] %2")
 				.arg(obs_module_text("CapCast.Status.Display"),
-				     found >= 0
-					     ? obs_module_text("CapCast.Status.Display.Found")
-					     : obs_module_text("CapCast.Status.Display.NotFound"));
+				     val);
 	}
 
-	/* 音频识别结果 */
-	const QString dev_id = audioCombo->currentData().toString();
-	if (!dev_id.isEmpty()) {
-		text += QStringLiteral("\n[%1] %2")
-				.arg(obs_module_text("CapCast.Status.Audio"),
-				     audioCombo->currentText());
-	} else {
-		const auto dev = capcast::pick_default_audio();
-		text += QStringLiteral("\n[%1] %2")
-				.arg(obs_module_text("CapCast.Status.Audio"),
-				     dev.name.isEmpty()
-					     ? obs_module_text("CapCast.Status.Audio.NotFound")
-					     : dev.name);
+	/* 音频目标: 同上三态 */
+	{
+		const auto b = capcast::resolve_audio_binding();
+		QString val;
+		if (b.match == CapCastDeviceMatch::Unbound) {
+			val = obs_module_text("CapCast.Status.NotSelected");
+		} else if (b.match == CapCastDeviceMatch::Missing) {
+			val = QString(obs_module_text(
+					      "CapCast.Status.TargetMissing"))
+				      .arg(b.name);
+		} else {
+			val = b.name;
+		}
+		text += QStringLiteral("\n[%1] %2").arg(
+			obs_module_text("CapCast.Status.Audio"), val);
 	}
 
 	/* 设备中途掉线: 如实显示"已断开", 别让界面继续显示"运行中" */
@@ -457,6 +464,13 @@ void CapCastSettings::onStartClicked()
 	const QString err = capcast::start_enabled();
 	if (err.isEmpty()) {
 		refreshStatus();
+
+		/* 有项因为"还没选目标"被跳过了: 如实写出来。
+		 * 否则用户看到另一项在跑, 会误以为全都起来了。 */
+		const QString note = capcast::last_start_note();
+		if (!note.isEmpty())
+			statusLabel->setText(statusLabel->text() +
+					     QStringLiteral("\n") + note);
 	} else {
 		statusLabel->setText(obs_module_text("CapCast.Status.Error") +
 				     QStringLiteral(": ") + err);
@@ -492,9 +506,14 @@ void CapCastSettings::onProjectorToggleClicked()
 	if (capcast::is_projector_active()) {
 		capcast::stop_projector();
 	} else {
-		int screen_index = displayCombo->currentData().toInt();
-		if (screen_index < 0)
-			screen_index = capcast::pick_default_screen();
+		const int screen_index = displayCombo->currentData().toInt();
+		/* 没选屏幕: 提示用户去选, 不替他猜一块 */
+		if (screen_index < 0) {
+			statusLabel->setText(
+				obs_module_text("CapCast.Status.NeedSelect.Projector"));
+			refreshToggleButtons();
+			return;
+		}
 
 		const CapCastProjectorSource src =
 			(sourceCombo->currentData().toString() ==
@@ -521,9 +540,14 @@ void CapCastSettings::onAudioToggleClicked()
 	if (capcast::is_audio_active()) {
 		capcast::stop_audio_mapping();
 	} else {
-		QString audio_id = audioCombo->currentData().toString();
-		if (audio_id.isEmpty())
-			audio_id = capcast::pick_default_audio().id;
+		const QString audio_id = audioCombo->currentData().toString();
+		/* 没选音频设备: 提示用户去选, 不替他挑一个 */
+		if (audio_id.isEmpty()) {
+			statusLabel->setText(
+				obs_module_text("CapCast.Status.NeedSelect.Audio"));
+			refreshToggleButtons();
+			return;
+		}
 
 		const QString err = capcast::start_audio_mapping(audio_id);
 		if (!err.isEmpty()) {

@@ -76,6 +76,10 @@ std::atomic<bool> g_audio_lost{false};
 /* OBS 正在退出时抑制弹窗, 别挡住退出流程 */
 std::atomic<bool> g_notify_enabled{true};
 
+/* 上次"批量开始"里因"还没选目标"而被跳过的功能名(供面板显示)。
+ * 只在主线程写(start_enabled)与读(last_start_note)。 */
+QString g_last_start_note;
+
 /* 本插件自己打开的那个全屏投影窗口。
  *
  * OBS 没有提供关闭投影的 API, 只能自己定位窗口。旧实现无差别遍历
@@ -739,37 +743,6 @@ QVector<CapCastScreen> enum_screens()
 	return out;
 }
 
-/* 自动选择"最像采集卡的副屏": 关键字优先, 否则第一个非主屏 */
-int pick_default_screen()
-{
-	const auto screens = enum_screens();
-	if (screens.isEmpty())
-		return -1;
-
-	/* 关键字优先 */
-	static const QStringList keywords = {
-		QStringLiteral("capture"), QStringLiteral("elgato"),
-		QStringLiteral("hd60"),   QStringLiteral("hdx"),
-		QStringLiteral("采集"),   QStringLiteral("录屏"),
-	};
-	for (const auto &sc : screens) {
-		if (sc.isPrimary)
-			continue;
-		const QString lower = sc.name.toLower();
-		for (const auto &kw : keywords) {
-			if (lower.contains(kw))
-				return sc.index;
-		}
-	}
-
-	/* 兜底: 第一个非主屏 */
-	for (const auto &sc : screens) {
-		if (!sc.isPrimary)
-			return sc.index;
-	}
-	return -1;
-}
-
 /* ---- 屏幕绑定解析: 名称优先 ----
  *
  * 为什么按名称而不是序号:
@@ -777,67 +750,55 @@ int pick_default_screen()
  *   少了一块屏, 同一个序号就指向另一块屏 —— 画面被投到错误的显示器上,
  *   而这种"静默换屏"用户往往很久才发现。设备名("\\.\DISPLAYn")则稳定。
  *
- * 手动模式 -> 只认上次那块屏, 找不到就 Missing, 由调用方提示。
- * 自动模式 -> 每次重新评估, 但与上次结果比对, 换了就报 Changed。 */
+ * 三态(调用方必须分别处理, 不能混):
+ *   Exact   -> 上次选的那块还在; 用它**当前**的序号, 不复用旧序号
+ *   Missing -> 选过, 但这次找不到了(屏被拔/被关)
+ *   Unbound -> 从没选过; 调用方应跳过该项
+ *
+ * 这里没有"自动挑一块屏"的分支: 替用户猜一块, 猜错(投到主屏或另一块
+ * 副屏)比干脆不开更糟。用户没选就是没选。 */
 CapCastScreenBinding resolve_screen_binding()
 {
 	CapCastScreenBinding out;
 	const auto screens = enum_screens();
-	const bool manual = (cfg_display_mode() == QStringLiteral("manual"));
 
-	if (manual) {
-		const QString bound = cfg_display_name();
-		if (!bound.isEmpty()) {
-			for (const auto &sc : screens) {
-				if (sc.name == bound) {
-					out.index = sc.index;
-					out.name = sc.name;
-					out.match = CapCastDeviceMatch::Exact;
-					return out;
-				}
+	const QString bound = cfg_display_name();
+	if (!bound.isEmpty()) {
+		for (const auto &sc : screens) {
+			if (sc.name == bound) {
+				out.index = sc.index;
+				out.name = sc.name;
+				out.match = CapCastDeviceMatch::Exact;
+				return out;
 			}
-			/* 名字对不上: 这块屏现在不在了 */
-			out.name = bound;
-			out.match = CapCastDeviceMatch::Missing;
-			return out;
 		}
-		/* 老配置只存了序号: 兼容一次, 并立刻把名称固化下来 */
-		const int legacy = cfg_display_index();
-		if (legacy >= 0 && legacy < screens.size()) {
-			out.index = legacy;
-			out.name = screens.at(legacy).name;
-			out.match = CapCastDeviceMatch::Exact;
-			bind_screen(out.name);
-			return out;
-		}
+		/* 选过, 但这块屏现在不在了 */
+		out.name = bound;
 		out.match = CapCastDeviceMatch::Missing;
 		return out;
 	}
 
-	/* 自动模式 */
-	const int picked = pick_default_screen();
-	if (picked < 0 || picked >= screens.size()) {
-		out.match = CapCastDeviceMatch::Missing;
-		return out;
-	}
-	out.index = picked;
-	out.name = screens.at(picked).name;
-
-	const QString last = cfg_display_name();
-	if (last.isEmpty())
-		out.match = CapCastDeviceMatch::Unbound;
-	else if (last == out.name)
+	/* 1.2.0 之前只存了序号: 兼容一次, 并立刻把名称固化下来 */
+	const int legacy = cfg_display_index();
+	if (legacy >= 0 && legacy < screens.size()) {
+		out.index = legacy;
+		out.name = screens.at(legacy).name;
 		out.match = CapCastDeviceMatch::Exact;
-	else
-		out.match = CapCastDeviceMatch::Changed;
-	bind_screen(out.name); /* 记录本次选择, 供下次比对 */
+		bind_screen(out.name);
+		CAPCAST_LOG(LOG_INFO, "migrated legacy display index %d -> %s",
+			    legacy, qUtf8Printable(out.name));
+		return out;
+	}
+
+	out.match = CapCastDeviceMatch::Unbound;
 	return out;
 }
 
 void bind_screen(const QString &name)
 {
-	if (!name.isEmpty())
-		cfg_set_display_name(name);
+	/* 传空串 = 明确取消选择(用户选了"未选择")。
+	 * 必须真的写空, 否则下次启动还会按旧名字把那块屏找回来。 */
+	cfg_set_display_name(name);
 }
 
 bool ensure_display_extend()
@@ -933,62 +894,15 @@ QVector<CapCastAudioDevice> enum_audio_devices()
 	return out;
 }
 
-/* 自动选择"最像采集卡的音频输出端点": 关键字优先, 否则第一个非默认音箱 */
-CapCastAudioDevice pick_default_audio()
-{
-	const auto devices = enum_audio_devices();
-	if (devices.isEmpty())
-		return {};
-
-	/* 排除明显是音箱/耳机的设备 */
-	static const QStringList skip_keywords = {
-		QStringLiteral("speaker"), QStringLiteral("耳机"),
-		QStringLiteral("音箱"),   QStringLiteral("headphone"),
-		QStringLiteral("realtek"), QStringLiteral("sound card"),
-		QStringLiteral("声卡"),
-	};
-	/* 采集卡关键字优先 */
-	static const QStringList capture_keywords = {
-		QStringLiteral("capture"), QStringLiteral("elgato"),
-		QStringLiteral("hd60"),   QStringLiteral("hdx"),
-		QStringLiteral("采集"),   QStringLiteral("video capture"),
-	};
-
-	/* 1. 名字含采集卡关键字 */
-	for (const auto &d : devices) {
-		const QString lower = d.name.toLower();
-		for (const auto &kw : capture_keywords) {
-			if (lower.contains(kw))
-				return d;
-		}
-	}
-
-	/* 2. 第一个非音箱/耳机设备 */
-	for (const auto &d : devices) {
-		const QString lower = d.name.toLower();
-		bool skip = false;
-		for (const auto &kw : skip_keywords) {
-			if (lower.contains(kw)) {
-				skip = true;
-				break;
-			}
-		}
-		if (!skip)
-			return d;
-	}
-
-	/* 3. 兜底第一个 */
-	return devices.first();
-}
-
 /* ---- 音频绑定解析: ID 优先, 名称兜底 ----
  *
  * 采集卡(尤其 USB)重新拔插后, WASAPI 设备 ID 里的 GUID 常变, 而友好名
  * 基本不变。因此: ID 命中就直接用; ID 变了再按名字找回并回写新 ID;
  * 两者都失败 -> Missing, 由调用方提示用户。
  *
- * 关键: 绝不退回 pick_default_audio() 换一个设备接着播。旧实现会这么干,
- * 声音因此可能同时走"采集卡 + 别的输出"两条路, 表现为严重混响。 */
+ * 关键: 绝不退回去"自动挑一个设备"接着播。旧实现会这么干, 声音因此可能
+ * 同时走"采集卡 + 别的输出"两条路, 表现为严重混响。没选过就 Unbound,
+ * 由调用方跳过该项。 */
 CapCastAudioBinding resolve_audio_binding()
 {
 	CapCastAudioBinding out;
@@ -996,28 +910,12 @@ CapCastAudioBinding resolve_audio_binding()
 	const QString bound_id = cfg_audio_device_id();
 	const QString bound_name = cfg_audio_device_name();
 
-	if (cfg_audio_mode() != QStringLiteral("manual")) {
-		/* 自动模式: 重新评估, 但换了设备要报 Changed, 不能默默换 */
-		const CapCastAudioDevice picked = pick_default_audio();
-		if (picked.id.isEmpty()) {
-			out.match = CapCastDeviceMatch::Missing;
-			return out;
-		}
-		out.id = picked.id;
-		out.name = picked.name;
-		if (bound_id.isEmpty())
-			out.match = CapCastDeviceMatch::Unbound;
-		else if (picked.id == bound_id)
-			out.match = CapCastDeviceMatch::Exact;
-		else if (!bound_name.isEmpty() && picked.name == bound_name)
-			out.match = CapCastDeviceMatch::Renamed;
-		else
-			out.match = CapCastDeviceMatch::Changed;
-		bind_audio(picked.id, picked.name);
+	/* 没选过: 不做任何猜测 */
+	if (bound_id.isEmpty() && bound_name.isEmpty()) {
+		out.match = CapCastDeviceMatch::Unbound;
 		return out;
 	}
 
-	/* 手动模式: 只认用户选的那一个 */
 	if (!bound_id.isEmpty()) {
 		for (const auto &d : devices) {
 			if (d.id == bound_id) {
@@ -1030,41 +928,35 @@ CapCastAudioBinding resolve_audio_binding()
 				return out;
 			}
 		}
-		/* ID 变了 -> 按友好名找回 */
-		if (!bound_name.isEmpty()) {
-			for (const auto &d : devices) {
-				if (d.name == bound_name) {
-					out.id = d.id;
-					out.name = d.name;
-					out.match = CapCastDeviceMatch::Renamed;
-					bind_audio(d.id, d.name); /* 回写新 ID */
-					return out;
-				}
-			}
-		}
-		out.id = bound_id;
-		out.name = bound_name;
-		out.match = CapCastDeviceMatch::Missing;
-		return out;
 	}
 
-	/* 手动模式却没记录: 退化成自动选一次并记下来 */
-	const CapCastAudioDevice picked = pick_default_audio();
-	if (!picked.id.isEmpty()) {
-		out.id = picked.id;
-		out.name = picked.name;
-		out.match = CapCastDeviceMatch::Unbound;
-		bind_audio(picked.id, picked.name);
-		return out;
+	/* ID 变了 -> 按友好名找回(USB 重新插拔后 GUID 常变, 名字一般不变) */
+	if (!bound_name.isEmpty()) {
+		for (const auto &d : devices) {
+			if (d.name == bound_name) {
+				out.id = d.id;
+				out.name = d.name;
+				out.match = CapCastDeviceMatch::Renamed;
+				CAPCAST_LOG(LOG_INFO,
+					    "audio device id changed, matched by name: %s",
+					    qUtf8Printable(d.name));
+				bind_audio(d.id, d.name); /* 回写新 ID */
+				return out;
+			}
+		}
 	}
+
+	/* 选过, 但这次两个都对不上 */
+	out.id = bound_id;
+	out.name = bound_name;
 	out.match = CapCastDeviceMatch::Missing;
 	return out;
 }
 
 void bind_audio(const QString &id, const QString &name)
 {
-	if (!id.isEmpty())
-		cfg_set_audio_device(name, id);
+	/* 两个都传空 = 明确取消选择, 必须真的写空(理由同 bind_screen) */
+	cfg_set_audio_device(name, id);
 }
 
 /* ================= 投屏 / 音频映射(各自独立控制) ================= */
@@ -1110,24 +1002,34 @@ QString start_projector(int screen_index, CapCastProjectorSource source)
 	if (g_proj_active.load(std::memory_order_relaxed))
 		stop_projector();
 
-	/* 未指定 -> 自动选择 */
+	/* 没选目标屏: 直接报错, 绝不替用户猜一块 */
 	if (screen_index < 0)
-		screen_index = pick_default_screen();
+		return QStringLiteral(
+			"未选择目标屏幕(请先在下拉框里选择采集卡副屏)");
 
 	auto screens = enum_screens();
 
-	/* 找不到副屏且允许自动扩展 -> 把显示拓扑设为"扩展"后重试一次 */
-	if ((screen_index < 0 || screen_index >= screens.size()) &&
-	    cfg_auto_extend()) {
-		CAPCAST_LOG(LOG_INFO,
-			    "capture screen not found, extending display...");
-		ensure_display_extend();
-		screens = enum_screens();
-		screen_index = pick_default_screen();
+	/* 序号对不上(拓扑变过 / 屏数少了): 按绑定名重新定位。
+	 * 不能直接沿用旧序号 —— 少一块屏时同一个序号会指向另一块屏。 */
+	if (screen_index >= screens.size()) {
+		const QString want = cfg_display_name();
+		if (!want.isEmpty()) {
+			for (int i = 0; i < screens.size(); ++i) {
+				if (screens.at(i).name == want) {
+					CAPCAST_LOG(
+						LOG_INFO,
+						"screen index %d moved to %d (matched by name %s)",
+						screen_index, i,
+						qUtf8Printable(want));
+					screen_index = i;
+					break;
+				}
+			}
+		}
 	}
 
-	if (screen_index < 0 || screen_index >= screens.size()) {
-		return QStringLiteral("采集卡副屏未找到(序号 %1 不存在)")
+	if (screen_index >= screens.size()) {
+		return QStringLiteral("目标屏幕当前不存在(序号 %1)")
 			.arg(screen_index);
 	}
 
@@ -1200,6 +1102,11 @@ void stop_projector()
 
 QString start_audio_mapping(const QString &audio_device_id)
 {
+	/* 没选目标设备: 直接报错, 绝不替用户猜一个 */
+	if (audio_device_id.isEmpty())
+		return QStringLiteral(
+			"未选择音频设备(请先在下拉框里选择采集卡音频端点)");
+
 	if (g_audio_active.load(std::memory_order_relaxed))
 		stop_audio_mapping();
 
@@ -1262,6 +1169,8 @@ static void notify_devices_missing(const QStringList &what,
 
 QString start_enabled()
 {
+	g_last_start_note.clear();
+
 	const bool want_proj = cfg_enable_projector();
 	const bool want_audio = cfg_enable_audio();
 
@@ -1272,18 +1181,22 @@ QString start_enabled()
 	}
 
 	/* 先解析设备绑定。
-	 * 找不到上次那台设备 -> 明确提示 + 关闭全部映射, 等用户重新选择。
 	 *
-	 * 这一步是"不要出意外"的核心: 旧实现会退回 pick_default_*() 换一台
-	 * 设备继续跑, 声音/画面因此可能走错地方(混响、投到另一块屏)。 */
+	 * 这一步是"不要出意外"的核心: 绝不替用户挑设备。旧实现会退回
+	 * pick_default_*() 换一台接着跑, 声音/画面因此可能走错地方
+	 * (混响、投到另一块屏)。现在只有三种结果:
+	 *   Exact/Renamed -> 用上次选的那台
+	 *   Missing       -> 提示 + 停止, 等用户处理
+	 *   Unbound       -> 这项没选过, 跳过(不影响另一项) */
 	CapCastScreenBinding sb = resolve_screen_binding();
 	const CapCastAudioBinding ab = resolve_audio_binding();
 
-	/* 副屏没亮、又允许自动扩展 -> 先扩展一次再重新解析。
+	/* 选过但这次找不到、又允许自动扩展 -> 先扩展一次再重新解析。
 	 * 扩展显示是"把采集卡点亮"的手段, 不是"换一台设备", 所以允许自动做;
-	 * 不这么做的话, 采集卡只是没被点亮就会被误判成"设备丢了"。 */
+	 * 不这么做的话, 采集卡只是没被点亮就会被误判成"设备丢了"。
+	 * 没选过(Unbound)不触发 —— 没有目标, 扩展无从谈起。 */
 	if (want_proj && cfg_auto_extend() &&
-	    (sb.match == CapCastDeviceMatch::Missing || sb.index < 0)) {
+	    sb.match == CapCastDeviceMatch::Missing) {
 		CAPCAST_LOG(LOG_INFO,
 			    "target display not present, extending display...");
 		ensure_display_extend();
@@ -1291,8 +1204,7 @@ QString start_enabled()
 	}
 
 	QStringList missing;
-	if (want_proj &&
-	    (sb.match == CapCastDeviceMatch::Missing || sb.index < 0))
+	if (want_proj && sb.match == CapCastDeviceMatch::Missing)
 		missing << obs_module_text("CapCast.Lost.What.Display");
 	if (want_audio && ab.match == CapCastDeviceMatch::Missing)
 		missing << obs_module_text("CapCast.Lost.What.Audio");
@@ -1307,31 +1219,45 @@ QString start_enabled()
 			.arg(missing.join(QStringLiteral("、")));
 	}
 
-	/* 自动模式下选中的设备与上次不同: 写进日志。
-	 * 不弹窗(选 auto 就是接受自动选择), 但必须留痕 —— 否则用户事后
-	 * 发现"这次声音/画面不对"时无从查起。 */
-	if (want_proj && sb.match == CapCastDeviceMatch::Changed)
-		CAPCAST_LOG(LOG_WARNING, "display target changed: %s",
-			    qUtf8Printable(sb.name));
-	if (want_audio && ab.match == CapCastDeviceMatch::Changed)
-		CAPCAST_LOG(LOG_WARNING, "audio target changed: %s",
-			    qUtf8Printable(ab.name));
+	/* 没选过 -> 该项跳过。
+	 * 不弹窗: 首次安装/首次启用必然是"还没选", 弹窗纯属骚扰。
+	 * 但仍要写日志与状态提示, 让用户知道"为什么这项没起来"。 */
+	QStringList skipped;
+	const bool proj_ready =
+		want_proj && sb.match != CapCastDeviceMatch::Unbound;
+	const bool audio_ready =
+		want_audio && ab.match != CapCastDeviceMatch::Unbound;
 
-	/* 设备 ID 变了但按名称找回: 说明采集卡重新枚举过, 记一笔 */
-	if (want_audio && ab.match == CapCastDeviceMatch::Renamed)
+	if (want_proj && !proj_ready) {
+		skipped << obs_module_text("CapCast.Lost.What.Display");
 		CAPCAST_LOG(LOG_INFO,
-			    "audio device id changed, matched by name: %s",
-			    qUtf8Printable(ab.name));
+			    "projector skipped: no screen selected yet");
+	}
+	if (want_audio && !audio_ready) {
+		skipped << obs_module_text("CapCast.Lost.What.Audio");
+		CAPCAST_LOG(LOG_INFO,
+			    "audio mapping skipped: no device selected yet");
+	}
+
+	if (!skipped.isEmpty())
+		g_last_start_note =
+			QString(obs_module_text("CapCast.Status.NotSelected.Note"))
+				.arg(skipped.join(QStringLiteral("、")));
+
+	if (!proj_ready && !audio_ready) {
+		CAPCAST_LOG(LOG_INFO, "start skipped: nothing selected yet");
+		return {};
+	}
 
 	QStringList errors;
 
-	if (want_proj) {
+	if (proj_ready) {
 		const QString e = start_projector(sb.index, resolve_source());
 		if (!e.isEmpty())
 			errors << QStringLiteral("投屏: %1").arg(e);
 	}
 
-	if (want_audio) {
+	if (audio_ready) {
 		const QString e = start_audio_mapping(ab.id);
 		if (!e.isEmpty())
 			errors << QStringLiteral("音频映射: %1").arg(e);
@@ -1339,6 +1265,13 @@ QString start_enabled()
 
 	/* 部分失败时, 成功那一项保持运行, 只把失败原因如实返回给界面 */
 	return errors.join(QStringLiteral("；"));
+}
+
+/* 上次"批量开始"的补充说明: 哪些项因为还没选目标而被跳过。
+ * 只由主线程写(start_enabled)与读(设置面板)。 */
+QString last_start_note()
+{
+	return g_last_start_note;
 }
 
 void stop_all()
@@ -1355,16 +1288,6 @@ static void cfg_flush()
 	config_save(user_config());
 }
 
-QString cfg_display_mode()
-{
-	return config_get_string(user_config(), CFG_SECTION, "DisplayMode");
-}
-void cfg_set_display_mode(const QString &m)
-{
-	config_set_string(user_config(), CFG_SECTION, "DisplayMode",
-			  qUtf8Printable(m));
-	cfg_flush();
-}
 int cfg_display_index()
 {
 	return (int)config_get_int(user_config(), CFG_SECTION, "DisplayIndex");
@@ -1386,16 +1309,6 @@ void cfg_set_display_name(const QString &n)
 	cfg_flush();
 }
 
-QString cfg_audio_mode()
-{
-	return config_get_string(user_config(), CFG_SECTION, "AudioMode");
-}
-void cfg_set_audio_mode(const QString &m)
-{
-	config_set_string(user_config(), CFG_SECTION, "AudioMode",
-			  qUtf8Printable(m));
-	cfg_flush();
-}
 QString cfg_audio_device_id()
 {
 	return config_get_string(user_config(), CFG_SECTION, "AudioDeviceId");

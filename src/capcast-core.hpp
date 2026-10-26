@@ -60,11 +60,18 @@ enum class CapCastDeviceKind {
  *   会随插拔/开关机变化 —— 用序号做持久化会悄悄指向另一块屏。
  *   因此一律"名称优先", ID 只作辅助校验。 */
 enum class CapCastDeviceMatch {
-	Exact,   /* 精确命中 */
+	Exact,   /* 精确命中: 上次选的那台还在, 直接用 */
 	Renamed, /* 名称命中但 ID 已变(已把新 ID 回写进配置) */
-	Changed, /* 自动模式下选中了与上次不同的设备(要提示, 不能静默) */
-	Missing, /* 列表里再也找不到这个设备 */
-	Unbound, /* 从未绑定过(首次使用, 自动模式第一次选) */
+	Missing, /* 选过, 但现在列表里找不到了(设备掉线/被拔) */
+	Unbound, /* 从未选择过: 用户还没选目标, 这一项不启动 */
+
+	/* 三种状态的处理方式完全不同, 不能混:
+	 *   Exact/Renamed -> 正常启动
+	 *   Missing       -> 弹窗提示 + 停止, 绝不换设备(否则会混响/投错屏)
+	 *   Unbound       -> 静默跳过(首次安装必然如此, 弹窗是骚扰)
+	 *
+	 * 之所以砍掉自动选择: 让插件"猜"一台设备来用, 猜错了(声音走两条路、
+	 * 画面投到别的屏)比不开更糟。用户没选就是没选, 不做任何动作。 */
 };
 
 /* 屏幕绑定解析结果 */
@@ -88,15 +95,12 @@ namespace capcast {
 /* 枚举当前所有屏幕(与 OBS 投影编号一致: 0 起) */
 QVector<CapCastScreen> enum_screens();
 
-/* 自动选择"最像采集卡的副屏": 关键字优先, 兜底第一个非主屏; 无副屏返回 -1 */
-int pick_default_screen();
-
-/* 解析"上次用的那块屏"是否还在。
+/* 解析"上次选的那块屏"是否还在。
  * 名称优先匹配, index 以本次枚举结果为准(序号会漂移, 不能直接用旧值)。
- * 未绑定过则回退到自动选择, 并把结果固化下来。 */
+ * 没选过 -> Unbound(调用方应跳过该项, 而不是随便找一块屏)。 */
 CapCastScreenBinding resolve_screen_binding();
 
-/* 固化屏幕绑定(用户手动选择, 或自动模式首次选定后落盘) */
+/* 固化屏幕绑定(用户在下拉框里选了某一块屏) */
 void bind_screen(const QString &name);
 
 /* 强制 Windows 显示模式为"扩展"(不动主屏、不复制), 用于把采集卡点亮成副屏 */
@@ -107,12 +111,10 @@ bool ensure_display_extend();
 /* 枚举全部活动中的 WASAPI 渲染(输出)端点 */
 QVector<CapCastAudioDevice> enum_audio_devices();
 
-/* 自动选择"最像采集卡的音频端点": 关键字优先, 兜底第一个非音箱设备 */
-CapCastAudioDevice pick_default_audio();
-
-/* 解析"上次用的那个音频端点"是否还在。
+/* 解析"上次选的那个音频端点"是否还在。
  * 先按 ID 精确匹配; ID 变了再按友好名匹配(命中则回写新 ID)。
- * 两者都失败 -> Missing, 调用方必须提示用户而不是改用别的设备。 */
+ * 两者都失败 -> Missing, 调用方必须提示用户而不是改用别的设备。
+ * 没选过 -> Unbound, 调用方应跳过该项而不是随便挑一个端点。 */
 CapCastAudioBinding resolve_audio_binding();
 
 /* 固化音频绑定 */
@@ -150,7 +152,7 @@ bool is_audio_active();
 bool is_output_active();
 
 /* 只开投屏。返回错误描述, 成功返回空串。
- * screen_index < 0 时由 pick_default_screen() 自动选择。
+ * screen_index < 0 直接报错 —— 不自动替你挑一块屏。
  * 只会记录并关闭"本插件自己打开"的那个投影窗口。 */
 QString start_projector(int screen_index, CapCastProjectorSource source);
 
@@ -158,32 +160,40 @@ QString start_projector(int screen_index, CapCastProjectorSource source);
 void stop_projector();
 
 /* 只开音频映射(订阅 OBS 主混音 -> 采集卡端点)。返回错误描述, 成功返回空串。
- * audio_device_id 为空时由 pick_default_audio() 自动选择。 */
+ * audio_device_id 为空直接报错 —— 不自动替你挑一个端点。 */
 QString start_audio_mapping(const QString &audio_device_id);
 
 /* 只关音频映射(取消订阅 + 释放 WASAPI) */
 void stop_audio_mapping();
 
 /* 批量开始: 按 EnableProjector / EnableAudio 两个勾选分别执行。
- * 两项都没勾选 -> 不做任何操作, 返回空串。
- * 某项失败 -> 成功项保持运行, 返回汇总错误描述(便于界面如实提示)。 */
+ *
+ * 每一项独立判定, 互不牵连:
+ *   没勾         -> 不动
+ *   勾了但没选目标 -> 跳过该项(另一项照常启动)
+ *   选了但设备不在 -> 弹窗提示 + 停止全部, 等用户重新处理
+ *   选了且设备在场 -> 正常启动
+ * 返回: 启动失败项的汇总描述(成功/跳过都返回空串)。 */
 QString start_enabled();
+
+/* 上次 start_enabled() 里因"还没选目标"而被跳过的功能名。
+ * 空串表示没有被跳过的项。供面板如实显示"为什么这项没起来"。 */
+QString last_start_note();
 
 /* 批量停止: 停掉当前正在运行的全部(投屏 + 音频), 与勾选状态无关。 */
 void stop_all();
 
 /* ---------- 配置持久化 ---------- */
 
-QString cfg_display_mode();                 /* "auto" | "manual" */
-void cfg_set_display_mode(const QString &m);
-int cfg_display_index(); /* 手动指定屏幕序号(旧配置残留, 仅作兜底) */
+/* 屏幕目标: 只认用户在下拉框里显式选过的那块。
+ * 没有"自动模式" —— 插件不会替你猜一块屏。 */
+int cfg_display_index(); /* 旧配置残留的序号, 仅首次升级时兜底一次 */
 void cfg_set_display_index(int idx);
-QString cfg_display_name(); /* 上次绑定的屏幕设备名, 如 "\\.\DISPLAY2" */
+QString cfg_display_name(); /* 选中的屏幕设备名, 如 "\\.\DISPLAY2" */
 void cfg_set_display_name(const QString &n);
 
-QString cfg_audio_mode();                   /* "auto" | "manual" */
-void cfg_set_audio_mode(const QString &m);
-QString cfg_audio_device_id();              /* 手动指定音频设备 ID */
+/* 音频目标: 同理, 只认显式选过的那个端点。 */
+QString cfg_audio_device_id();
 QString cfg_audio_device_name();
 void cfg_set_audio_device(const QString &name, const QString &id);
 

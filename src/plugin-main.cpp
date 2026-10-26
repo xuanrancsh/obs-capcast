@@ -46,6 +46,12 @@ static void resolve_and_start()
 		blog(LOG_WARNING, "[CapCast] start failed: %s",
 		     qUtf8Printable(err));
 	}
+	/* 有项因"还没选目标设备"被跳过时也要留痕。
+	 * 自动启动(尤其无人值守的机器)时面板未必开着, 日志是唯一线索 ——
+	 * 否则用户只会看到"音频没起来", 却查不到原因。 */
+	const QString note = capcast::last_start_note();
+	if (!note.isEmpty())
+		blog(LOG_INFO, "[CapCast] skipped: %s", qUtf8Printable(note));
 }
 
 static void toggle_output()
@@ -75,7 +81,9 @@ static void frontend_event(enum obs_frontend_event event, void *)
 		 *   - 该总闸关闭 -> 插件完全不启动, 不做任何事;
 		 *   - 该总闸开启 -> 按上次勾选的项目分别启动
 		 *     (只勾了音频就只开音频, 只勾了投屏就只开投屏, 都勾就都开);
-		 *   - 上次两项都没勾 -> start_enabled() 内部直接跳过, 不操作。 */
+		 *   - 上次两项都没勾 -> start_enabled() 内部直接跳过, 不操作;
+		 *   - 某项勾了但没选过目标设备 -> 只跳过该项, 另一项照常启动
+		 *     (不会自动改用别的设备, 也不会弹窗打扰)。 */
 		if (capcast::cfg_auto_start()) {
 			blog(LOG_INFO, "[CapCast] auto start on launch");
 			QMetaObject::invokeMethod(

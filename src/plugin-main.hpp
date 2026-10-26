@@ -7,4 +7,4 @@
 
 #define PLUGIN_NAME "capcast"
 #define PLUGIN_DISPLAY_NAME "采集卡一键推流"
-#define PLUGIN_VERSION "1.2.0"
+#define PLUGIN_VERSION "1.3.0"
