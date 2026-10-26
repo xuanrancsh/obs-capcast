@@ -52,6 +52,13 @@
 #include <vector>
 #endif
 
+/* 掉线上报: 定义在文件后面的"设备监控"区, 这里先在**文件作用域**声明,
+ * 供匿名 namespace 内的 WASAPI 写入路径使用。
+ * 注意: 必须放在匿名 namespace 之外 —— 声明与定义要落在同一个作用域,
+ *       否则 MSVC 报 C2129(declared but not defined)。 */
+static void report_audio_lost();
+static void report_display_lost();
+
 /* ================= 内部状态 ================= */
 namespace {
 
@@ -68,11 +75,6 @@ std::atomic<bool> g_display_lost{false};
 std::atomic<bool> g_audio_lost{false};
 /* OBS 正在退出时抑制弹窗, 别挡住退出流程 */
 std::atomic<bool> g_notify_enabled{true};
-
-/* 掉线上报: 定义在后面的"设备监控"区, 这里先声明,
- * 供 WASAPI 写入路径与 Qt 屏幕信号回调使用。 */
-static void report_audio_lost();
-static void report_display_lost();
 
 /* 本插件自己打开的那个全屏投影窗口。
  *
@@ -1345,6 +1347,221 @@ void stop_all()
 	stop_audio_mapping();
 }
 
+
+/* ================= 配置持久化 =================
+ * 注意: 每次写入后立即 config_save, 保证设置持久化到磁盘 */
+static void cfg_flush()
+{
+	config_save(user_config());
+}
+
+QString cfg_display_mode()
+{
+	return config_get_string(user_config(), CFG_SECTION, "DisplayMode");
+}
+void cfg_set_display_mode(const QString &m)
+{
+	config_set_string(user_config(), CFG_SECTION, "DisplayMode",
+			  qUtf8Printable(m));
+	cfg_flush();
+}
+int cfg_display_index()
+{
+	return (int)config_get_int(user_config(), CFG_SECTION, "DisplayIndex");
+}
+void cfg_set_display_index(int idx)
+{
+	config_set_int(user_config(), CFG_SECTION, "DisplayIndex", idx);
+	cfg_flush();
+}
+
+QString cfg_display_name()
+{
+	return config_get_string(user_config(), CFG_SECTION, "DisplayName");
+}
+void cfg_set_display_name(const QString &n)
+{
+	config_set_string(user_config(), CFG_SECTION, "DisplayName",
+			  qUtf8Printable(n));
+	cfg_flush();
+}
+
+QString cfg_audio_mode()
+{
+	return config_get_string(user_config(), CFG_SECTION, "AudioMode");
+}
+void cfg_set_audio_mode(const QString &m)
+{
+	config_set_string(user_config(), CFG_SECTION, "AudioMode",
+			  qUtf8Printable(m));
+	cfg_flush();
+}
+QString cfg_audio_device_id()
+{
+	return config_get_string(user_config(), CFG_SECTION, "AudioDeviceId");
+}
+QString cfg_audio_device_name()
+{
+	return config_get_string(user_config(), CFG_SECTION, "AudioDeviceName");
+}
+void cfg_set_audio_device(const QString &name, const QString &id)
+{
+	config_set_string(user_config(), CFG_SECTION, "AudioDeviceName",
+			  qUtf8Printable(name));
+	config_set_string(user_config(), CFG_SECTION, "AudioDeviceId",
+			  qUtf8Printable(id));
+	cfg_flush();
+}
+
+double cfg_audio_volume()
+{
+	/* 未设置过 -> 默认 50%(用 has_user_value 判断, 避免把用户主动设的 0
+	 * 当成"未设置"而重置回 50) */
+	if (!config_has_user_value(user_config(), CFG_SECTION, "AudioVolume"))
+		return 50.0;
+	return config_get_double(user_config(), CFG_SECTION, "AudioVolume");
+}
+void cfg_set_audio_volume(double percent)
+{
+	config_set_double(user_config(), CFG_SECTION, "AudioVolume", percent);
+	cfg_flush();
+}
+
+void set_output_volume(double percent)
+{
+	/* 仅运行时生效: 音频线程下一次回调就会用新的增益, 无需重启路由。
+	 * 不在此处落盘 —— 拖动滑块会高频触发, 持久化交给设置面板保存时做。 */
+	g_volume_pct.store(percent, std::memory_order_relaxed);
+}
+
+int cfg_audio_track()
+{
+	const int t =
+		(int)config_get_int(user_config(), CFG_SECTION, "AudioTrack");
+	/* 未设置过或值非法 -> 默认音轨 1 */
+	if (t < 1 || (size_t)t > MAX_AUDIO_MIXES)
+		return 1;
+	return t;
+}
+void cfg_set_audio_track(int track)
+{
+	config_set_int(user_config(), CFG_SECTION, "AudioTrack", track);
+	cfg_flush();
+}
+
+void apply_audio_track(int track)
+{
+#ifdef _WIN32
+	if (!g_wasapi.active)
+		return; /* 未运行: 下次开始时生效 */
+
+	const size_t new_mix = mix_index_from_track(track);
+	const size_t old_mix =
+		(size_t)g_mix_idx.load(std::memory_order_relaxed);
+	if (new_mix == old_mix)
+		return;
+
+	/* 先用原索引取消订阅, 再按新索引重新订阅 */
+	obs_remove_raw_audio_callback(old_mix, on_master_audio, nullptr);
+	g_mix_idx.store((int)new_mix, std::memory_order_relaxed);
+
+	if (obs_get_audio()) {
+		struct audio_convert_info conv{};
+		conv.samples_per_sec = g_wasapi.sample_rate;
+		conv.format = AUDIO_FORMAT_FLOAT;
+		conv.speakers = layout_from_channels(g_wasapi.channels);
+		conv.allow_clipping = true;
+		obs_add_raw_audio_callback(new_mix, &conv, on_master_audio,
+					   nullptr);
+	}
+	CAPCAST_LOG(LOG_INFO, "audio track switched: mix %d -> mix %d",
+		    (int)old_mix, (int)new_mix);
+#else
+	Q_UNUSED(track);
+#endif
+}
+
+void stop_audio_only()
+{
+	/* 只停音频并释放自有资源, 不触碰任何 Qt 窗口(原因见头文件注释)。
+	 *
+	 * 注意: 卸载时调用 obs_remove_raw_audio_callback 是安全的 ——
+	 * obs_shutdown() 的执行顺序是 stop_video() -> stop_audio() ->
+	 * stop_hotkeys() -> free_module(), 即音频子系统先于模块卸载被销毁;
+	 * stop_audio() 会把 obs->audio.audio 置 NULL, 而
+	 * audio_output_disconnect() 开头就有 `if (!audio) return;`,
+	 * 因此这里的取消订阅会直接空操作返回, 不会踩空指针。
+	 * (audio_output_close() 也已经把我们的回调连接一并释放了。)
+	 *
+	 * 投影窗口则由 OBS 自己在退出时销毁。 */
+	stop_audio_routing();
+	g_audio_active.store(false, std::memory_order_relaxed);
+	g_proj_active.store(false, std::memory_order_relaxed);
+}
+
+QString cfg_source()
+{
+	return config_get_string(user_config(), CFG_SECTION, "Source");
+}
+void cfg_set_source(const QString &s)
+{
+	config_set_string(user_config(), CFG_SECTION, "Source",
+			  qUtf8Printable(s));
+	cfg_flush();
+}
+
+bool cfg_auto_start()
+{
+	return config_get_bool(user_config(), CFG_SECTION, "AutoStart");
+}
+void cfg_set_auto_start(bool v)
+{
+	config_set_bool(user_config(), CFG_SECTION, "AutoStart", v);
+	cfg_flush();
+}
+
+/* 功能勾选默认 true(首次安装即可用)。
+ * 用 has_user_value 区分"用户主动取消勾选(false)"与"从未设置过",
+ * 否则每次启动都会把用户取消的勾又勾回来。 */
+bool cfg_enable_projector()
+{
+	if (!config_has_user_value(user_config(), CFG_SECTION,
+				   "EnableProjector"))
+		return true;
+	return config_get_bool(user_config(), CFG_SECTION, "EnableProjector");
+}
+void cfg_set_enable_projector(bool v)
+{
+	config_set_bool(user_config(), CFG_SECTION, "EnableProjector", v);
+	cfg_flush();
+}
+
+bool cfg_enable_audio()
+{
+	if (!config_has_user_value(user_config(), CFG_SECTION, "EnableAudio"))
+		return true;
+	return config_get_bool(user_config(), CFG_SECTION, "EnableAudio");
+}
+void cfg_set_enable_audio(bool v)
+{
+	config_set_bool(user_config(), CFG_SECTION, "EnableAudio", v);
+	cfg_flush();
+}
+
+bool cfg_auto_extend()
+{
+	if (!config_has_user_value(user_config(), CFG_SECTION, "AutoExtend"))
+		return true;
+	return config_get_bool(user_config(), CFG_SECTION, "AutoExtend");
+}
+void cfg_set_auto_extend(bool v)
+{
+	config_set_bool(user_config(), CFG_SECTION, "AutoExtend", v);
+	cfg_flush();
+}
+
+} // namespace capcast
+
 /* ================= 设备掉线监控与提醒 =================
  * 目标: 设备中途消失时让用户第一时间知道, 而不是默默换一个设备继续跑。
  *
@@ -1626,220 +1843,6 @@ bool is_device_returned(CapCastDeviceKind kind)
 void set_lost_notifications_enabled(bool on)
 {
 	g_notify_enabled.store(on, std::memory_order_release);
-}
-
-} // namespace capcast
-
-/* ================= 配置持久化 =================
- * 注意: 每次写入后立即 config_save, 保证设置持久化到磁盘 */
-static void cfg_flush()
-{
-	config_save(user_config());
-}
-
-QString cfg_display_mode()
-{
-	return config_get_string(user_config(), CFG_SECTION, "DisplayMode");
-}
-void cfg_set_display_mode(const QString &m)
-{
-	config_set_string(user_config(), CFG_SECTION, "DisplayMode",
-			  qUtf8Printable(m));
-	cfg_flush();
-}
-int cfg_display_index()
-{
-	return (int)config_get_int(user_config(), CFG_SECTION, "DisplayIndex");
-}
-void cfg_set_display_index(int idx)
-{
-	config_set_int(user_config(), CFG_SECTION, "DisplayIndex", idx);
-	cfg_flush();
-}
-
-QString cfg_display_name()
-{
-	return config_get_string(user_config(), CFG_SECTION, "DisplayName");
-}
-void cfg_set_display_name(const QString &n)
-{
-	config_set_string(user_config(), CFG_SECTION, "DisplayName",
-			  qUtf8Printable(n));
-	cfg_flush();
-}
-
-QString cfg_audio_mode()
-{
-	return config_get_string(user_config(), CFG_SECTION, "AudioMode");
-}
-void cfg_set_audio_mode(const QString &m)
-{
-	config_set_string(user_config(), CFG_SECTION, "AudioMode",
-			  qUtf8Printable(m));
-	cfg_flush();
-}
-QString cfg_audio_device_id()
-{
-	return config_get_string(user_config(), CFG_SECTION, "AudioDeviceId");
-}
-QString cfg_audio_device_name()
-{
-	return config_get_string(user_config(), CFG_SECTION, "AudioDeviceName");
-}
-void cfg_set_audio_device(const QString &name, const QString &id)
-{
-	config_set_string(user_config(), CFG_SECTION, "AudioDeviceName",
-			  qUtf8Printable(name));
-	config_set_string(user_config(), CFG_SECTION, "AudioDeviceId",
-			  qUtf8Printable(id));
-	cfg_flush();
-}
-
-double cfg_audio_volume()
-{
-	/* 未设置过 -> 默认 50%(用 has_user_value 判断, 避免把用户主动设的 0
-	 * 当成"未设置"而重置回 50) */
-	if (!config_has_user_value(user_config(), CFG_SECTION, "AudioVolume"))
-		return 50.0;
-	return config_get_double(user_config(), CFG_SECTION, "AudioVolume");
-}
-void cfg_set_audio_volume(double percent)
-{
-	config_set_double(user_config(), CFG_SECTION, "AudioVolume", percent);
-	cfg_flush();
-}
-
-void set_output_volume(double percent)
-{
-	/* 仅运行时生效: 音频线程下一次回调就会用新的增益, 无需重启路由。
-	 * 不在此处落盘 —— 拖动滑块会高频触发, 持久化交给设置面板保存时做。 */
-	g_volume_pct.store(percent, std::memory_order_relaxed);
-}
-
-int cfg_audio_track()
-{
-	const int t =
-		(int)config_get_int(user_config(), CFG_SECTION, "AudioTrack");
-	/* 未设置过或值非法 -> 默认音轨 1 */
-	if (t < 1 || (size_t)t > MAX_AUDIO_MIXES)
-		return 1;
-	return t;
-}
-void cfg_set_audio_track(int track)
-{
-	config_set_int(user_config(), CFG_SECTION, "AudioTrack", track);
-	cfg_flush();
-}
-
-void apply_audio_track(int track)
-{
-#ifdef _WIN32
-	if (!g_wasapi.active)
-		return; /* 未运行: 下次开始时生效 */
-
-	const size_t new_mix = mix_index_from_track(track);
-	const size_t old_mix =
-		(size_t)g_mix_idx.load(std::memory_order_relaxed);
-	if (new_mix == old_mix)
-		return;
-
-	/* 先用原索引取消订阅, 再按新索引重新订阅 */
-	obs_remove_raw_audio_callback(old_mix, on_master_audio, nullptr);
-	g_mix_idx.store((int)new_mix, std::memory_order_relaxed);
-
-	if (obs_get_audio()) {
-		struct audio_convert_info conv{};
-		conv.samples_per_sec = g_wasapi.sample_rate;
-		conv.format = AUDIO_FORMAT_FLOAT;
-		conv.speakers = layout_from_channels(g_wasapi.channels);
-		conv.allow_clipping = true;
-		obs_add_raw_audio_callback(new_mix, &conv, on_master_audio,
-					   nullptr);
-	}
-	CAPCAST_LOG(LOG_INFO, "audio track switched: mix %d -> mix %d",
-		    (int)old_mix, (int)new_mix);
-#else
-	Q_UNUSED(track);
-#endif
-}
-
-void stop_audio_only()
-{
-	/* 只停音频并释放自有资源, 不触碰任何 Qt 窗口(原因见头文件注释)。
-	 *
-	 * 注意: 卸载时调用 obs_remove_raw_audio_callback 是安全的 ——
-	 * obs_shutdown() 的执行顺序是 stop_video() -> stop_audio() ->
-	 * stop_hotkeys() -> free_module(), 即音频子系统先于模块卸载被销毁;
-	 * stop_audio() 会把 obs->audio.audio 置 NULL, 而
-	 * audio_output_disconnect() 开头就有 `if (!audio) return;`,
-	 * 因此这里的取消订阅会直接空操作返回, 不会踩空指针。
-	 * (audio_output_close() 也已经把我们的回调连接一并释放了。)
-	 *
-	 * 投影窗口则由 OBS 自己在退出时销毁。 */
-	stop_audio_routing();
-	g_audio_active.store(false, std::memory_order_relaxed);
-	g_proj_active.store(false, std::memory_order_relaxed);
-}
-
-QString cfg_source()
-{
-	return config_get_string(user_config(), CFG_SECTION, "Source");
-}
-void cfg_set_source(const QString &s)
-{
-	config_set_string(user_config(), CFG_SECTION, "Source",
-			  qUtf8Printable(s));
-	cfg_flush();
-}
-
-bool cfg_auto_start()
-{
-	return config_get_bool(user_config(), CFG_SECTION, "AutoStart");
-}
-void cfg_set_auto_start(bool v)
-{
-	config_set_bool(user_config(), CFG_SECTION, "AutoStart", v);
-	cfg_flush();
-}
-
-/* 功能勾选默认 true(首次安装即可用)。
- * 用 has_user_value 区分"用户主动取消勾选(false)"与"从未设置过",
- * 否则每次启动都会把用户取消的勾又勾回来。 */
-bool cfg_enable_projector()
-{
-	if (!config_has_user_value(user_config(), CFG_SECTION,
-				   "EnableProjector"))
-		return true;
-	return config_get_bool(user_config(), CFG_SECTION, "EnableProjector");
-}
-void cfg_set_enable_projector(bool v)
-{
-	config_set_bool(user_config(), CFG_SECTION, "EnableProjector", v);
-	cfg_flush();
-}
-
-bool cfg_enable_audio()
-{
-	if (!config_has_user_value(user_config(), CFG_SECTION, "EnableAudio"))
-		return true;
-	return config_get_bool(user_config(), CFG_SECTION, "EnableAudio");
-}
-void cfg_set_enable_audio(bool v)
-{
-	config_set_bool(user_config(), CFG_SECTION, "EnableAudio", v);
-	cfg_flush();
-}
-
-bool cfg_auto_extend()
-{
-	if (!config_has_user_value(user_config(), CFG_SECTION, "AutoExtend"))
-		return true;
-	return config_get_bool(user_config(), CFG_SECTION, "AutoExtend");
-}
-void cfg_set_auto_extend(bool v)
-{
-	config_set_bool(user_config(), CFG_SECTION, "AutoExtend", v);
-	cfg_flush();
 }
 
 } // namespace capcast
