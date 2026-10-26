@@ -1519,7 +1519,7 @@ private:
 		const QString bound = capcast::cfg_audio_device_id();
 		if (bound.isEmpty())
 			return;
-		if (capcast::wide_to_qstring(id) == bound)
+		if (wide_to_qstring(id) == bound)
 			report_audio_lost();
 	}
 	LONG m_ref;
@@ -1564,11 +1564,14 @@ void device_monitor_start()
 	}
 #endif
 
-	/* 副屏消失: 显示器被移除时 Qt 会发这个信号 */
-	if (QGuiApplication::instance() && !g_screen_removed_conn) {
+	/* 副屏消失: 显示器被移除时 Qt 会发这个信号。
+	 * 注意用 qGuiApp 而不是 QGuiApplication::instance() —— 后者其实是
+	 * QCoreApplication::instance(), 返回 QCoreApplication*, 与
+	 * &QGuiApplication::screenRemoved 这个成员指针对不上, 编译不过。 */
+	if (qGuiApp && !g_screen_removed_conn) {
 		g_screen_removed_conn = QObject::connect(
-			QGuiApplication::instance(),
-			&QGuiApplication::screenRemoved, [](QScreen *s) {
+			qGuiApp, &QGuiApplication::screenRemoved,
+			[](QScreen *s) {
 				if (!s)
 					return;
 				const QString bound = cfg_display_name();
