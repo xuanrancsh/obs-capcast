@@ -327,6 +327,16 @@ void CapCastSettings::saveSettings()
 	if (screen_idx >= 0) {
 		capcast::cfg_set_display_mode(QStringLiteral("manual"));
 		capcast::cfg_set_display_index(screen_idx);
+		/* 同时按名称固化绑定。
+		 * 序号会在插拔后漂移(少一块屏时, 同一个序号就指向另一块屏),
+		 * 所以真正用来恢复的是设备名, 序号只作旧配置兼容。 */
+		const auto screens = capcast::enum_screens();
+		for (const auto &sc : screens) {
+			if (sc.index == screen_idx) {
+				capcast::bind_screen(sc.name);
+				break;
+			}
+		}
 	} else {
 		capcast::cfg_set_display_mode(QStringLiteral("auto"));
 	}
@@ -413,6 +423,25 @@ void CapCastSettings::refreshStatus()
 					     ? obs_module_text("CapCast.Status.Audio.NotFound")
 					     : dev.name);
 	}
+
+	/* 设备中途掉线: 如实显示"已断开", 别让界面继续显示"运行中" */
+	if (capcast::is_device_lost(CapCastDeviceKind::Display))
+		text += QStringLiteral("\n[%1] %2")
+				.arg(obs_module_text("CapCast.Status.Display"),
+				     obs_module_text(
+					     "CapCast.Status.DeviceLost"));
+	if (capcast::is_device_lost(CapCastDeviceKind::Audio))
+		text += QStringLiteral("\n[%1] %2")
+				.arg(obs_module_text(
+					     "CapCast.Status.AudioMapping"),
+				     obs_module_text(
+					     "CapCast.Status.DeviceLost"));
+
+	/* 掉线的设备又插回来了: 告诉用户可以重新应用了 */
+	if (capcast::is_device_returned(CapCastDeviceKind::Display) ||
+	    capcast::is_device_returned(CapCastDeviceKind::Audio))
+		text += QStringLiteral("\n%1").arg(
+			obs_module_text("CapCast.Status.DeviceReturned"));
 
 	statusLabel->setText(text);
 	refreshToggleButtons();

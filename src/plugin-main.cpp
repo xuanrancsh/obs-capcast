@@ -84,8 +84,13 @@ static void frontend_event(enum obs_frontend_event event, void *)
 		}
 	} else if (event == OBS_FRONTEND_EVENT_EXIT ||
 		   event == OBS_FRONTEND_EVENT_SCRIPTING_SHUTDOWN) {
-		/* OBS 开始关闭: 立刻停止投屏与音频路由, 移除场景上的过滤器,
-		 * 避免后续被 OBS 销毁时回调到我们已卸载的代码 */
+		/* OBS 开始关闭。
+		 * 先关掉掉线提醒 —— 退出过程中显示器/音频设备可能先被系统摘掉,
+		 * 若不抑制就会弹出"设备已断开"挡住退出流程。 */
+		capcast::set_lost_notifications_enabled(false);
+
+		/* 立刻停止投屏与音频路由, 避免后续被 OBS 销毁时回调到我们
+		 * 已卸载的代码 */
 		capcast::stop_all();
 	}
 }
@@ -119,6 +124,9 @@ bool obs_module_load(void)
 		obs_frontend_pop_ui_translation();
 	}
 
+	/* 设备掉线监控: 采集卡中途被拔掉/禁用时提醒用户, 而不是悄悄换设备 */
+	capcast::device_monitor_start();
+
 	/* 事件回调: 启动自动推流 / 退出清理 */
 	obs_frontend_add_event_callback(frontend_event, nullptr);
 
@@ -135,6 +143,9 @@ bool obs_module_load(void)
 void obs_module_unload(void)
 {
 	blog(LOG_INFO, "[CapCast] unloading...");
+
+	/* 0. 先停设备监控: 卸载后不能再收到 WASAPI/Qt 的设备回调 */
+	capcast::device_monitor_stop();
 
 	/* 1. 先注销回调, 防止卸载后 OBS 再回调到已失效的代码 */
 	obs_frontend_remove_event_callback(frontend_event, nullptr);

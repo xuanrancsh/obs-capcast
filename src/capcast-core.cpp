@@ -33,6 +33,8 @@
 #include <QPointer>
 #include <QSet>
 #include <QHash>
+#include <QObject>
+#include <QMessageBox>
 
 #include <atomic>
 
@@ -57,6 +59,20 @@ namespace {
  * 读写跨 UI 线程 / OBS 音频线程 / 模块卸载路径, 故用 atomic。 */
 std::atomic<bool> g_proj_active{false};
 std::atomic<bool> g_audio_active{false};
+
+/* ---- 设备掉线状态 ----
+ * 设备消失时该项映射会被主动停掉并置位这里。作用有两个:
+ *   1. 面板据此显示真实状态("设备已断开"), 而不是假的"运行中";
+ *   2. 重新应用之前, 不允许自动改用别的设备(这是"意外"的根源)。 */
+std::atomic<bool> g_display_lost{false};
+std::atomic<bool> g_audio_lost{false};
+/* OBS 正在退出时抑制弹窗, 别挡住退出流程 */
+std::atomic<bool> g_notify_enabled{true};
+
+/* 掉线上报: 定义在后面的"设备监控"区, 这里先声明,
+ * 供 WASAPI 写入路径与 Qt 屏幕信号回调使用。 */
+static void report_audio_lost();
+static void report_display_lost();
 
 /* 本插件自己打开的那个全屏投影窗口。
  *
@@ -389,6 +405,30 @@ static void convert_float_to_device(const float *src, uint8_t *dst,
 }
 
 /* 把 OBS 主混音(交错 float32, 已是设备采样率/声道)写入采集卡端点 */
+/* 连续写入失败计数。
+ *
+ * 为什么需要: 设备被拔掉后 WASAPI 不会主动通知(除非注册通知回调), 而
+ * GetCurrentPadding() / GetBuffer() 会持续返回 AUDCLNT_E_DEVICE_INVALIDATED
+ * 之类的错误。旧实现把这些错误全部静默 return —— 于是音频其实早就没了,
+ * 插件却仍显示"运行中", 用户事后才发现(甚至因回退到别的设备而出现混响)。
+ *
+ * 这里累计连续失败次数, 达到阈值即判定"设备真的掉了"并上报。
+ * OBS 音频线程每秒约 100 次回调, 阈值 40 ≈ 0.4 秒, 可避开偶发抖动。 */
+static std::atomic<int> g_audio_write_failures{0};
+
+static void note_audio_write_result(bool ok)
+{
+	if (ok) {
+		g_audio_write_failures.store(0, std::memory_order_relaxed);
+		return;
+	}
+	const int n = g_audio_write_failures.fetch_add(
+			      1, std::memory_order_relaxed) +
+		      1;
+	if (n == 40)
+		report_audio_lost();
+}
+
 static void wasapi_write_audio(const float *src, uint32_t frames)
 {
 	std::lock_guard<std::recursive_mutex> lk(g_wasapi.mtx);
@@ -414,8 +454,10 @@ static void wasapi_write_audio(const float *src, uint32_t frames)
 				      : g_wasapi.buffer_frames / 2;
 
 	UINT32 pad = 0;
-	if (FAILED(g_wasapi.client->GetCurrentPadding(&pad)))
+	if (FAILED(g_wasapi.client->GetCurrentPadding(&pad))) {
+		note_audio_write_result(false);
 		return;
+	}
 
 	/* 3) 自适应: 设备时钟略慢于 OBS 时积压会缓慢上涨,
 	 *    每次最多丢 1ms, 听感无感, 但能长期把延迟钉在低位。 */
@@ -433,8 +475,10 @@ static void wasapi_write_audio(const float *src, uint32_t frames)
 	/* 4) 写入设备环形缓冲(不阻塞 OBS 音频线程) */
 	UINT32 remaining = frames;
 	while (remaining > 0) {
-		if (FAILED(g_wasapi.client->GetCurrentPadding(&pad)))
+		if (FAILED(g_wasapi.client->GetCurrentPadding(&pad))) {
+			note_audio_write_result(false);
 			return;
+		}
 		const UINT32 avail = g_wasapi.buffer_frames - pad;
 		if (avail == 0)
 			break; /* 缓冲满: 丢弃剩余 */
@@ -443,13 +487,16 @@ static void wasapi_write_audio(const float *src, uint32_t frames)
 		BYTE *dst = nullptr;
 		/* 取缓冲失败: 放弃本帧剩余部分。不能阻塞 OBS 音频线程,
 		 * 也不能对未成功 GetBuffer 的句柄调用 ReleaseBuffer。 */
-		if (FAILED(g_wasapi.render->GetBuffer(chunk, &dst)))
+		if (FAILED(g_wasapi.render->GetBuffer(chunk, &dst))) {
+			note_audio_write_result(false);
 			return;
+		}
 		memcpy(dst, data, (size_t)chunk * g_wasapi.frame_bytes);
 		data += (size_t)chunk * g_wasapi.frame_bytes;
 		remaining -= chunk;
 		g_wasapi.render->ReleaseBuffer(chunk, 0);
 	}
+	note_audio_write_result(true);
 }
 
 /* OBS 主混音回调(在 OBS 音频线程执行) */
@@ -646,39 +693,39 @@ QVector<CapCastScreen> enum_screens()
 		sc.name = s->name();
 		sc.isPrimary = (s == QGuiApplication::primaryScreen());
 
-	const QSize logical = s->size();
+		const QSize logical = s->size();
 
-	/* 物理分辨率: 以 Windows 报告的当前显示模式为准权威值。
-	 * 拿不到(非 Windows 或 API 失败)时才退回 Qt 的 size()。 */
-	QSize physical = logical;
+		/* 物理分辨率: 以 Windows 报告的当前显示模式为准权威值。
+		 * 拿不到(非 Windows 或 API 失败)时才退回 Qt 的 size()。 */
+		QSize physical = logical;
 #ifdef _WIN32
-	{
-		bool have = false;
-		QSize p;
-		auto it = win.physicalByName.constFind(sc.name);
-		if (it != win.physicalByName.constEnd()) {
-			p = *it;
-			have = true;
-		} else if (i < win.physicalByOrder.size()) {
-			/* 设备名对不上(Qt 可能返回友好名)时, 按枚举顺序兜底 */
-			p = win.physicalByOrder.at(i);
-			have = true;
+		{
+			bool have = false;
+			QSize p;
+			auto it = win.physicalByName.constFind(sc.name);
+			if (it != win.physicalByName.constEnd()) {
+				p = *it;
+				have = true;
+			} else if (i < win.physicalByOrder.size()) {
+				/* 设备名对不上(Qt 可能返回友好名)时, 按枚举顺序兜底 */
+				p = win.physicalByOrder.at(i);
+				have = true;
+			}
+			if (have && p.width() > 0 && p.height() > 0)
+				physical = p;
 		}
-		if (have && p.width() > 0 && p.height() > 0)
-			physical = p;
-	}
 #endif
 
-	/* 缩放倍数 = 物理 / 逻辑。OBS 已是 DPI 感知时两者相等 -> 1.0(不会误放大);
-	 * 非感知时 4K@300% 会得到 3.0, 正好解释"为何显示成 1280x720"。 */
-	const double scale = (logical.width() > 0)
-				     ? static_cast<double>(physical.width()) /
-					       static_cast<double>(logical.width())
-				     : 1.0;
+		/* 缩放倍数 = 物理 / 逻辑。OBS 已是 DPI 感知时两者相等 -> 1.0(不会误放大);
+		 * 非感知时 4K@300% 会得到 3.0, 正好解释"为何显示成 1280x720"。 */
+		const double scale = (logical.width() > 0)
+					     ? static_cast<double>(physical.width()) /
+						       static_cast<double>(logical.width())
+					     : 1.0;
 
-	sc.logical = logical;
-	sc.physical = physical;
-	sc.scale = (scale >= 1.0) ? scale : 1.0;
+		sc.logical = logical;
+		sc.physical = physical;
+		sc.scale = (scale >= 1.0) ? scale : 1.0;
 
 		int refresh = static_cast<int>(s->refreshRate());
 		sc.geometry = QStringLiteral("%1x%2@%3")
@@ -719,6 +766,76 @@ int pick_default_screen()
 			return sc.index;
 	}
 	return -1;
+}
+
+/* ---- 屏幕绑定解析: 名称优先 ----
+ *
+ * 为什么按名称而不是序号:
+ *   Qt 的屏幕序号会随显示器插拔/开关机重排。旧实现把序号存进配置, 一旦
+ *   少了一块屏, 同一个序号就指向另一块屏 —— 画面被投到错误的显示器上,
+ *   而这种"静默换屏"用户往往很久才发现。设备名("\\.\DISPLAYn")则稳定。
+ *
+ * 手动模式 -> 只认上次那块屏, 找不到就 Missing, 由调用方提示。
+ * 自动模式 -> 每次重新评估, 但与上次结果比对, 换了就报 Changed。 */
+CapCastScreenBinding resolve_screen_binding()
+{
+	CapCastScreenBinding out;
+	const auto screens = enum_screens();
+	const bool manual = (cfg_display_mode() == QStringLiteral("manual"));
+
+	if (manual) {
+		const QString bound = cfg_display_name();
+		if (!bound.isEmpty()) {
+			for (const auto &sc : screens) {
+				if (sc.name == bound) {
+					out.index = sc.index;
+					out.name = sc.name;
+					out.match = CapCastDeviceMatch::Exact;
+					return out;
+				}
+			}
+			/* 名字对不上: 这块屏现在不在了 */
+			out.name = bound;
+			out.match = CapCastDeviceMatch::Missing;
+			return out;
+		}
+		/* 老配置只存了序号: 兼容一次, 并立刻把名称固化下来 */
+		const int legacy = cfg_display_index();
+		if (legacy >= 0 && legacy < screens.size()) {
+			out.index = legacy;
+			out.name = screens.at(legacy).name;
+			out.match = CapCastDeviceMatch::Exact;
+			bind_screen(out.name);
+			return out;
+		}
+		out.match = CapCastDeviceMatch::Missing;
+		return out;
+	}
+
+	/* 自动模式 */
+	const int picked = pick_default_screen();
+	if (picked < 0 || picked >= screens.size()) {
+		out.match = CapCastDeviceMatch::Missing;
+		return out;
+	}
+	out.index = picked;
+	out.name = screens.at(picked).name;
+
+	const QString last = cfg_display_name();
+	if (last.isEmpty())
+		out.match = CapCastDeviceMatch::Unbound;
+	else if (last == out.name)
+		out.match = CapCastDeviceMatch::Exact;
+	else
+		out.match = CapCastDeviceMatch::Changed;
+	bind_screen(out.name); /* 记录本次选择, 供下次比对 */
+	return out;
+}
+
+void bind_screen(const QString &name)
+{
+	if (!name.isEmpty())
+		cfg_set_display_name(name);
 }
 
 bool ensure_display_extend()
@@ -862,6 +979,92 @@ CapCastAudioDevice pick_default_audio()
 	return devices.first();
 }
 
+/* ---- 音频绑定解析: ID 优先, 名称兜底 ----
+ *
+ * 采集卡(尤其 USB)重新拔插后, WASAPI 设备 ID 里的 GUID 常变, 而友好名
+ * 基本不变。因此: ID 命中就直接用; ID 变了再按名字找回并回写新 ID;
+ * 两者都失败 -> Missing, 由调用方提示用户。
+ *
+ * 关键: 绝不退回 pick_default_audio() 换一个设备接着播。旧实现会这么干,
+ * 声音因此可能同时走"采集卡 + 别的输出"两条路, 表现为严重混响。 */
+CapCastAudioBinding resolve_audio_binding()
+{
+	CapCastAudioBinding out;
+	const auto devices = enum_audio_devices();
+	const QString bound_id = cfg_audio_device_id();
+	const QString bound_name = cfg_audio_device_name();
+
+	if (cfg_audio_mode() != QStringLiteral("manual")) {
+		/* 自动模式: 重新评估, 但换了设备要报 Changed, 不能默默换 */
+		const CapCastAudioDevice picked = pick_default_audio();
+		if (picked.id.isEmpty()) {
+			out.match = CapCastDeviceMatch::Missing;
+			return out;
+		}
+		out.id = picked.id;
+		out.name = picked.name;
+		if (bound_id.isEmpty())
+			out.match = CapCastDeviceMatch::Unbound;
+		else if (picked.id == bound_id)
+			out.match = CapCastDeviceMatch::Exact;
+		else if (!bound_name.isEmpty() && picked.name == bound_name)
+			out.match = CapCastDeviceMatch::Renamed;
+		else
+			out.match = CapCastDeviceMatch::Changed;
+		bind_audio(picked.id, picked.name);
+		return out;
+	}
+
+	/* 手动模式: 只认用户选的那一个 */
+	if (!bound_id.isEmpty()) {
+		for (const auto &d : devices) {
+			if (d.id == bound_id) {
+				out.id = d.id;
+				out.name = d.name;
+				out.match = CapCastDeviceMatch::Exact;
+				/* 友好名变了(如驱动更新)顺手同步, 便于以后按名找回 */
+				if (!d.name.isEmpty() && d.name != bound_name)
+					bind_audio(d.id, d.name);
+				return out;
+			}
+		}
+		/* ID 变了 -> 按友好名找回 */
+		if (!bound_name.isEmpty()) {
+			for (const auto &d : devices) {
+				if (d.name == bound_name) {
+					out.id = d.id;
+					out.name = d.name;
+					out.match = CapCastDeviceMatch::Renamed;
+					bind_audio(d.id, d.name); /* 回写新 ID */
+					return out;
+				}
+			}
+		}
+		out.id = bound_id;
+		out.name = bound_name;
+		out.match = CapCastDeviceMatch::Missing;
+		return out;
+	}
+
+	/* 手动模式却没记录: 退化成自动选一次并记下来 */
+	const CapCastAudioDevice picked = pick_default_audio();
+	if (!picked.id.isEmpty()) {
+		out.id = picked.id;
+		out.name = picked.name;
+		out.match = CapCastDeviceMatch::Unbound;
+		bind_audio(picked.id, picked.name);
+		return out;
+	}
+	out.match = CapCastDeviceMatch::Missing;
+	return out;
+}
+
+void bind_audio(const QString &id, const QString &name)
+{
+	if (!id.isEmpty())
+		cfg_set_audio_device(name, id);
+}
+
 /* ================= 投屏 / 音频映射(各自独立控制) ================= */
 
 bool is_projector_active()
@@ -879,20 +1082,17 @@ bool is_output_active()
 	return is_projector_active() || is_audio_active();
 }
 
-/* 解析目标屏幕序号: <0 表示自动选择 */
+/* 解析目标屏幕序号: 统一走绑定解析(名称优先), <0 表示没找到。
+ * 不再直接返回配置里的序号 —— 序号会在插拔后指向另一块屏。 */
 static int resolve_screen_index()
 {
-	if (cfg_display_mode() == QStringLiteral("manual"))
-		return cfg_display_index();
-	return -1;
+	return resolve_screen_binding().index;
 }
 
-/* 解析目标音频设备 ID: 空串表示自动选择 */
+/* 解析目标音频设备 ID: 统一走绑定解析(ID 优先, 名称兜底), 空串=没找到 */
 static QString resolve_audio_device()
 {
-	if (cfg_audio_mode() == QStringLiteral("manual"))
-		return cfg_audio_device_id();
-	return QString();
+	return resolve_audio_binding().id;
 }
 
 static CapCastProjectorSource resolve_source()
@@ -962,6 +1162,8 @@ QString start_projector(int screen_index, CapCastProjectorSource source)
 
 	g_projector = mine;
 	g_proj_active.store(true, std::memory_order_relaxed);
+	/* 重新启动成功 -> 清掉"设备已断开"标记 */
+	g_display_lost.store(false, std::memory_order_release);
 	{
 		const CapCastScreen sc = screens.at(screen_index);
 		CAPCAST_LOG(LOG_INFO,
@@ -1007,6 +1209,9 @@ QString start_audio_mapping(const QString &audio_device_id)
 		return err;
 	}
 	g_audio_active.store(true, std::memory_order_relaxed);
+	/* 重新启动成功 -> 清掉"设备已断开"标记 */
+	g_audio_lost.store(false, std::memory_order_release);
+	g_audio_write_failures.store(0, std::memory_order_relaxed);
 	return {};
 }
 
@@ -1014,6 +1219,43 @@ void stop_audio_mapping()
 {
 	stop_audio_routing();
 	g_audio_active.store(false, std::memory_order_relaxed);
+}
+
+/* 启动(含 OBS 重启后自动恢复)时找不到之前那台设备的提醒。
+ * 与"运行中断开"的区别: 这里是按原设置恢复失败, 需要用户重新选设备。 */
+static void notify_devices_missing(const QStringList &what,
+				   const QString &display_name,
+				   const QString &audio_name)
+{
+	if (!g_notify_enabled.load(std::memory_order_relaxed))
+		return;
+
+	QString detail;
+	if (!display_name.isEmpty())
+		detail += QStringLiteral("%1: %2\n").arg(
+			obs_module_text("CapCast.Lost.What.Display"),
+			display_name);
+	if (!audio_name.isEmpty())
+		detail += QStringLiteral("%1: %2\n").arg(
+			obs_module_text("CapCast.Lost.What.Audio"),
+			audio_name);
+
+	const QString head =
+		QString(obs_module_text("CapCast.Lost.NotFound.Body"))
+			.arg(what.join(QStringLiteral("、")));
+
+	QString body = head;
+	if (!detail.isEmpty())
+		body += QStringLiteral("\n\n%1").arg(detail);
+	body += QStringLiteral("\n\n%1").arg(
+		obs_module_text("CapCast.Lost.Why"));
+	body += QStringLiteral("\n\n%1").arg(
+		obs_module_text("CapCast.Lost.NotFound.Fix"));
+
+	QWidget *parent =
+		static_cast<QWidget *>(obs_frontend_get_main_window());
+	QMessageBox::warning(parent, obs_module_text("CapCast.Lost.Title"),
+			     body, QMessageBox::Ok);
 }
 
 QString start_enabled()
@@ -1027,17 +1269,68 @@ QString start_enabled()
 		return {};
 	}
 
+	/* 先解析设备绑定。
+	 * 找不到上次那台设备 -> 明确提示 + 关闭全部映射, 等用户重新选择。
+	 *
+	 * 这一步是"不要出意外"的核心: 旧实现会退回 pick_default_*() 换一台
+	 * 设备继续跑, 声音/画面因此可能走错地方(混响、投到另一块屏)。 */
+	CapCastScreenBinding sb = resolve_screen_binding();
+	const CapCastAudioBinding ab = resolve_audio_binding();
+
+	/* 副屏没亮、又允许自动扩展 -> 先扩展一次再重新解析。
+	 * 扩展显示是"把采集卡点亮"的手段, 不是"换一台设备", 所以允许自动做;
+	 * 不这么做的话, 采集卡只是没被点亮就会被误判成"设备丢了"。 */
+	if (want_proj && cfg_auto_extend() &&
+	    (sb.match == CapCastDeviceMatch::Missing || sb.index < 0)) {
+		CAPCAST_LOG(LOG_INFO,
+			    "target display not present, extending display...");
+		ensure_display_extend();
+		sb = resolve_screen_binding();
+	}
+
+	QStringList missing;
+	if (want_proj &&
+	    (sb.match == CapCastDeviceMatch::Missing || sb.index < 0))
+		missing << obs_module_text("CapCast.Lost.What.Display");
+	if (want_audio && ab.match == CapCastDeviceMatch::Missing)
+		missing << obs_module_text("CapCast.Lost.What.Audio");
+
+	if (!missing.isEmpty()) {
+		stop_all();
+		notify_devices_missing(missing, sb.name, ab.name);
+		CAPCAST_LOG(LOG_WARNING,
+			    "start aborted: device(s) missing: %s",
+			    qUtf8Printable(missing.join(QStringLiteral("、"))));
+		return QString(obs_module_text("CapCast.Lost.NotFound.Start"))
+			.arg(missing.join(QStringLiteral("、")));
+	}
+
+	/* 自动模式下选中的设备与上次不同: 写进日志。
+	 * 不弹窗(选 auto 就是接受自动选择), 但必须留痕 —— 否则用户事后
+	 * 发现"这次声音/画面不对"时无从查起。 */
+	if (want_proj && sb.match == CapCastDeviceMatch::Changed)
+		CAPCAST_LOG(LOG_WARNING, "display target changed: %s",
+			    qUtf8Printable(sb.name));
+	if (want_audio && ab.match == CapCastDeviceMatch::Changed)
+		CAPCAST_LOG(LOG_WARNING, "audio target changed: %s",
+			    qUtf8Printable(ab.name));
+
+	/* 设备 ID 变了但按名称找回: 说明采集卡重新枚举过, 记一笔 */
+	if (want_audio && ab.match == CapCastDeviceMatch::Renamed)
+		CAPCAST_LOG(LOG_INFO,
+			    "audio device id changed, matched by name: %s",
+			    qUtf8Printable(ab.name));
+
 	QStringList errors;
 
 	if (want_proj) {
-		const QString e =
-			start_projector(resolve_screen_index(), resolve_source());
+		const QString e = start_projector(sb.index, resolve_source());
 		if (!e.isEmpty())
 			errors << QStringLiteral("投屏: %1").arg(e);
 	}
 
 	if (want_audio) {
-		const QString e = start_audio_mapping(resolve_audio_device());
+		const QString e = start_audio_mapping(ab.id);
 		if (!e.isEmpty())
 			errors << QStringLiteral("音频映射: %1").arg(e);
 	}
@@ -1051,6 +1344,288 @@ void stop_all()
 	stop_projector();
 	stop_audio_mapping();
 }
+
+/* ================= 设备掉线监控与提醒 =================
+ * 目标: 设备中途消失时让用户第一时间知道, 而不是默默换一个设备继续跑。
+ *
+ * 三条检测路径:
+ *   1. WASAPI 设备通知(IMMNotificationClient) —— 拔掉/禁用时立刻触发;
+ *   2. 音频写入连续失败计数 —— 兜底, 覆盖"ID 变了""通知没发出来"等情况;
+ *   3. QGuiApplication::screenRemoved —— 采集卡副屏消失。
+ *
+ * 响应原则(与旧行为的关键差别):
+ *   - 立刻停掉受影响的那一项, 不让界面继续显示假的"运行中";
+ *   - 弹窗说清楚是哪个设备;
+ *   - 不改写用户配置, 不自动改用别的设备 —— 那才是混响/投错屏的根源。 */
+
+static void notify_lost(CapCastDeviceKind kind, const QString &name);
+
+/* 音频掉线上报。
+ * 可能从 OBS 音频线程或 COM 回调线程进来, 因此这里只置位 + 投递到
+ * Qt 主线程, 绝不直接动 OBS/Qt 对象(在音频回调里移除回调会出事)。 */
+static void report_audio_lost()
+{
+	if (g_audio_lost.load(std::memory_order_acquire))
+		return; /* 同一件事只报一次, 避免抖动时连弹 */
+	if (!g_audio_active.load(std::memory_order_relaxed))
+		return; /* 本来就没在跑, 不关我们的事 */
+	g_audio_lost.store(true, std::memory_order_release);
+
+	QMetaObject::invokeMethod(
+		qApp,
+		[] {
+			/* 已切到 Qt 主线程, 可以安全停止映射并弹窗 */
+			if (!g_audio_active.load(std::memory_order_relaxed)) {
+				g_audio_lost.store(false,
+						   std::memory_order_release);
+				return;
+			}
+			const QString name = capcast::cfg_audio_device_name();
+			capcast::stop_audio_mapping();
+			CAPCAST_LOG(LOG_WARNING,
+				    "audio device lost: %s (mapping stopped, settings kept)",
+				    qUtf8Printable(name));
+			notify_lost(CapCastDeviceKind::Audio, name);
+		},
+		Qt::QueuedConnection);
+}
+
+/* 副屏掉线上报, 同上: 只置位 + 投递 */
+static void report_display_lost()
+{
+	if (g_display_lost.load(std::memory_order_acquire))
+		return;
+	if (!g_proj_active.load(std::memory_order_relaxed))
+		return;
+	g_display_lost.store(true, std::memory_order_release);
+
+	QMetaObject::invokeMethod(
+		qApp,
+		[] {
+			if (!g_proj_active.load(std::memory_order_relaxed)) {
+				g_display_lost.store(false,
+						     std::memory_order_release);
+				return;
+			}
+			const QString name = capcast::cfg_display_name();
+			capcast::stop_projector();
+			CAPCAST_LOG(LOG_WARNING,
+				    "display lost: %s (projector stopped, settings kept)",
+				    qUtf8Printable(name));
+			notify_lost(CapCastDeviceKind::Display, name);
+		},
+		Qt::QueuedConnection);
+}
+
+static void notify_lost(CapCastDeviceKind kind, const QString &name)
+{
+	if (!g_notify_enabled.load(std::memory_order_relaxed))
+		return; /* OBS 正在退出, 别弹窗挡住 */
+
+	const bool audio = (kind == CapCastDeviceKind::Audio);
+	const QString shown =
+		name.isEmpty() ? QStringLiteral("(未命名设备)") : name;
+
+	/* 文案分三段(现象 / 为什么这么做 / 怎么办), 用空行拼接。
+	 * 注意: ini 文件里的 "\n" 只是字面两个字符, 不会变成换行,
+	 *       所以换行必须在代码里加。 */
+	const QString what =
+		audio ? QString(obs_module_text("CapCast.Lost.Audio.Body"))
+		      : QString(obs_module_text("CapCast.Lost.Display.Body"));
+
+	const QString body = QStringLiteral("%1\n\n%2\n\n%3")
+				     .arg(what.arg(shown))
+				     .arg(obs_module_text("CapCast.Lost.Why"))
+				     .arg(obs_module_text("CapCast.Lost.Fix"));
+
+	QWidget *parent =
+		static_cast<QWidget *>(obs_frontend_get_main_window());
+	QMessageBox::warning(parent,
+			     obs_module_text("CapCast.Lost.Title"), body,
+			     QMessageBox::Ok);
+}
+
+#ifdef _WIN32
+/* WASAPI 设备通知。
+ * COM 回调线程里只判断"掉的是不是我们绑定的那个", 后续动作交给
+ * report_audio_lost() 投递到主线程, 避免在回调里碰 OBS/Qt。 */
+class CapCastAudioNotify : public IMMNotificationClient {
+public:
+	CapCastAudioNotify() : m_ref(1) {}
+
+	/* IUnknown */
+	HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid,
+						void **ppv) override
+	{
+		if (!ppv)
+			return E_POINTER;
+		if (riid == IID_IUnknown ||
+		    riid == __uuidof(IMMNotificationClient)) {
+			*ppv = static_cast<IMMNotificationClient *>(this);
+			AddRef();
+			return S_OK;
+		}
+		*ppv = nullptr;
+		return E_NOINTERFACE;
+	}
+	ULONG STDMETHODCALLTYPE AddRef() override
+	{
+		return (ULONG)InterlockedIncrement(&m_ref);
+	}
+	ULONG STDMETHODCALLTYPE Release() override
+	{
+		const ULONG r = (ULONG)InterlockedDecrement(&m_ref);
+		if (r == 0)
+			delete this;
+		return r;
+	}
+
+	/* IMMNotificationClient */
+	HRESULT STDMETHODCALLTYPE OnDeviceStateChanged(LPCWSTR id,
+						      DWORD state) override
+	{
+		if (state == DEVICE_STATE_NOTPRESENT ||
+		    state == DEVICE_STATE_UNPLUGGED)
+			lost_if_bound(id);
+		return S_OK;
+	}
+	HRESULT STDMETHODCALLTYPE OnDeviceRemoved(LPCWSTR id) override
+	{
+		lost_if_bound(id);
+		return S_OK;
+	}
+	HRESULT STDMETHODCALLTYPE OnDeviceAdded(LPCWSTR) override
+	{
+		return S_OK;
+	}
+	HRESULT STDMETHODCALLTYPE OnDefaultDeviceChanged(EDataFlow, ERole,
+							LPCWSTR) override
+	{
+		return S_OK;
+	}
+	HRESULT STDMETHODCALLTYPE OnPropertyValueChanged(
+		LPCWSTR, const PROPERTYKEY) override
+	{
+		return S_OK;
+	}
+
+private:
+	/* 只关心我们绑定的那一个设备; 没绑定过就交给写入失败兜底,
+	 * 免得别的设备拔插也来打扰用户 */
+	void lost_if_bound(LPCWSTR id)
+	{
+		if (!id)
+			return;
+		const QString bound = capcast::cfg_audio_device_id();
+		if (bound.isEmpty())
+			return;
+		if (capcast::wide_to_qstring(id) == bound)
+			report_audio_lost();
+	}
+	LONG m_ref;
+};
+#endif // _WIN32
+
+namespace capcast {
+
+#ifdef _WIN32
+static IMMDeviceEnumerator *g_notify_enumerator = nullptr;
+static IMMNotificationClient *g_notify_client = nullptr;
+#endif
+static QMetaObject::Connection g_screen_removed_conn;
+
+void device_monitor_start()
+{
+#ifdef _WIN32
+	HRESULT hrInit = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+	(void)hrInit;
+	if (!g_notify_client) {
+		static const GUID clsid = {
+			0xBCDE0395, 0xE52F, 0x467C,
+			{0x8E, 0x3D, 0xC4, 0x57, 0x92, 0x91, 0x69, 0x2E}};
+		IMMDeviceEnumerator *enumerator = nullptr;
+		HRESULT hr = CoCreateInstance(clsid, nullptr, CLSCTX_ALL,
+					      IID_PPV_ARGS(&enumerator));
+		if (SUCCEEDED(hr) && enumerator) {
+			auto *client = new CapCastAudioNotify();
+			if (SUCCEEDED(enumerator->RegisterEndpointNotificationCallback(
+				    client))) {
+				g_notify_enumerator = enumerator;
+				g_notify_client = client;
+				CAPCAST_LOG(LOG_INFO,
+					    "audio device monitor started");
+			} else {
+				client->Release();
+				enumerator->Release();
+				CAPCAST_LOG(LOG_WARNING,
+					    "audio device monitor: register failed");
+			}
+		}
+	}
+#endif
+
+	/* 副屏消失: 显示器被移除时 Qt 会发这个信号 */
+	if (QGuiApplication::instance() && !g_screen_removed_conn) {
+		g_screen_removed_conn = QObject::connect(
+			QGuiApplication::instance(),
+			&QGuiApplication::screenRemoved, [](QScreen *s) {
+				if (!s)
+					return;
+				const QString bound = cfg_display_name();
+				if (bound.isEmpty())
+					return;
+				if (s->name() == bound)
+					report_display_lost();
+			});
+	}
+}
+
+void device_monitor_stop()
+{
+#ifdef _WIN32
+	if (g_notify_enumerator && g_notify_client) {
+		g_notify_enumerator->UnregisterEndpointNotificationCallback(
+			g_notify_client);
+		g_notify_client->Release();
+		g_notify_client = nullptr;
+		g_notify_enumerator->Release();
+		g_notify_enumerator = nullptr;
+		CAPCAST_LOG(LOG_INFO, "audio device monitor stopped");
+	}
+#endif
+	if (g_screen_removed_conn) {
+		QObject::disconnect(g_screen_removed_conn);
+		g_screen_removed_conn = QMetaObject::Connection();
+	}
+}
+
+bool is_device_lost(CapCastDeviceKind kind)
+{
+	return (kind == CapCastDeviceKind::Audio)
+		       ? g_audio_lost.load(std::memory_order_acquire)
+		       : g_display_lost.load(std::memory_order_acquire);
+}
+
+/* 掉线后设备又回来了(重新插上): 供面板提示"可以重新应用了" */
+bool is_device_returned(CapCastDeviceKind kind)
+{
+	if (!is_device_lost(kind))
+		return false;
+	if (kind == CapCastDeviceKind::Audio) {
+		const auto b = resolve_audio_binding();
+		return b.match == CapCastDeviceMatch::Exact ||
+		       b.match == CapCastDeviceMatch::Renamed;
+	}
+	const auto b = resolve_screen_binding();
+	return b.match == CapCastDeviceMatch::Exact;
+}
+
+void set_lost_notifications_enabled(bool on)
+{
+	g_notify_enabled.store(on, std::memory_order_release);
+}
+
+} // namespace capcast
 
 /* ================= 配置持久化 =================
  * 注意: 每次写入后立即 config_save, 保证设置持久化到磁盘 */
@@ -1076,6 +1651,17 @@ int cfg_display_index()
 void cfg_set_display_index(int idx)
 {
 	config_set_int(user_config(), CFG_SECTION, "DisplayIndex", idx);
+	cfg_flush();
+}
+
+QString cfg_display_name()
+{
+	return config_get_string(user_config(), CFG_SECTION, "DisplayName");
+}
+void cfg_set_display_name(const QString &n)
+{
+	config_set_string(user_config(), CFG_SECTION, "DisplayName",
+			  qUtf8Printable(n));
 	cfg_flush();
 }
 

@@ -45,6 +45,42 @@ enum class CapCastProjectorSource {
 	Preview, /* 预览(PVW) */
 };
 
+/* 设备种类(掉线提醒用) */
+enum class CapCastDeviceKind {
+	Display, /* 采集卡副屏 */
+	Audio,   /* 采集卡音频端点 */
+};
+
+/* 上次绑定的设备, 本次能否再找到。
+ *
+ * 为什么要区分"名对上了/ID 变了":
+ *   Windows 的 WASAPI 设备 ID 形如 "{0.0.0.00000000}.{GUID}", USB 采集卡
+ *   换个接口或重新枚举后 GUID 会变, 但友好名(如 "Elgato HD60 X")通常不变。
+ *   同理, 显示器设备名("\\.\DISPLAY2")稳定, 但它在 Qt 列表里的**序号**
+ *   会随插拔/开关机变化 —— 用序号做持久化会悄悄指向另一块屏。
+ *   因此一律"名称优先", ID 只作辅助校验。 */
+enum class CapCastDeviceMatch {
+	Exact,   /* 精确命中 */
+	Renamed, /* 名称命中但 ID 已变(已把新 ID 回写进配置) */
+	Changed, /* 自动模式下选中了与上次不同的设备(要提示, 不能静默) */
+	Missing, /* 列表里再也找不到这个设备 */
+	Unbound, /* 从未绑定过(首次使用, 自动模式第一次选) */
+};
+
+/* 屏幕绑定解析结果 */
+struct CapCastScreenBinding {
+	int index = -1; /* 解析出的 Qt 屏幕序号, <0 表示没找到 */
+	CapCastDeviceMatch match = CapCastDeviceMatch::Unbound;
+	QString name; /* 绑定的设备名, 如 "\\.\DISPLAY2" */
+};
+
+/* 音频绑定解析结果 */
+struct CapCastAudioBinding {
+	QString id;
+	QString name;
+	CapCastDeviceMatch match = CapCastDeviceMatch::Unbound;
+};
+
 namespace capcast {
 
 /* ---------- 显示器 ---------- */
@@ -54,6 +90,14 @@ QVector<CapCastScreen> enum_screens();
 
 /* 自动选择"最像采集卡的副屏": 关键字优先, 兜底第一个非主屏; 无副屏返回 -1 */
 int pick_default_screen();
+
+/* 解析"上次用的那块屏"是否还在。
+ * 名称优先匹配, index 以本次枚举结果为准(序号会漂移, 不能直接用旧值)。
+ * 未绑定过则回退到自动选择, 并把结果固化下来。 */
+CapCastScreenBinding resolve_screen_binding();
+
+/* 固化屏幕绑定(用户手动选择, 或自动模式首次选定后落盘) */
+void bind_screen(const QString &name);
 
 /* 强制 Windows 显示模式为"扩展"(不动主屏、不复制), 用于把采集卡点亮成副屏 */
 bool ensure_display_extend();
@@ -65,6 +109,32 @@ QVector<CapCastAudioDevice> enum_audio_devices();
 
 /* 自动选择"最像采集卡的音频端点": 关键字优先, 兜底第一个非音箱设备 */
 CapCastAudioDevice pick_default_audio();
+
+/* 解析"上次用的那个音频端点"是否还在。
+ * 先按 ID 精确匹配; ID 变了再按友好名匹配(命中则回写新 ID)。
+ * 两者都失败 -> Missing, 调用方必须提示用户而不是改用别的设备。 */
+CapCastAudioBinding resolve_audio_binding();
+
+/* 固化音频绑定 */
+void bind_audio(const QString &id, const QString &name);
+
+/* ---------- 设备掉线监控 ----------
+ * 运行期间监听设备消失: 音频走 WASAPI 设备通知 + 写入失败计数兜底,
+ * 显示走 QGuiApplication::screenRemoved。
+ * 掉线时只做"停止该项 + 提醒", 绝不自动换设备。 */
+
+/* 启动/停止设备监控(插件加载/卸载时调用) */
+void device_monitor_start();
+void device_monitor_stop();
+
+/* 该项是否因设备掉线而处于"停摆"状态(供面板显示真实状态) */
+bool is_device_lost(CapCastDeviceKind kind);
+
+/* 掉线后设备又回来了: 返回 true 表示可以重新应用 */
+bool is_device_returned(CapCastDeviceKind kind);
+
+/* 抑制提醒(OBS 退出流程中不要弹窗挡住退出) */
+void set_lost_notifications_enabled(bool on);
 
 /* ---------- 投屏 / 音频映射(各自独立控制) ----------
  * 投屏与音频映射是两项互不依赖的功能, 可分别开启/关闭。
@@ -106,8 +176,10 @@ void stop_all();
 
 QString cfg_display_mode();                 /* "auto" | "manual" */
 void cfg_set_display_mode(const QString &m);
-int cfg_display_index();                    /* 手动指定屏幕序号 */
+int cfg_display_index(); /* 手动指定屏幕序号(旧配置残留, 仅作兜底) */
 void cfg_set_display_index(int idx);
+QString cfg_display_name(); /* 上次绑定的屏幕设备名, 如 "\\.\DISPLAY2" */
+void cfg_set_display_name(const QString &n);
 
 QString cfg_audio_mode();                   /* "auto" | "manual" */
 void cfg_set_audio_mode(const QString &m);
